@@ -23,15 +23,6 @@ export const config = {
   ADMIN_ID: parseInt(require_env('ADMIN_ID'), 10),
   BSC_RPC_URL: require_env('BSC_RPC_URL'),
   LOG_LEVEL: optional_env('LOG_LEVEL', 'info'),
-
-  // Binance Agentic Wallet deep-link base URL.
-  // When left blank, the bot shows an honest "adapter not configured" message
-  // rather than generating a fake/non-functional pairing link.
-  // Set to your real Binance Skills / MCP pairing endpoint when available.
-  BINANCE_WALLET_PAIRING_BASE_URL: optional_env('BINANCE_WALLET_PAIRING_BASE_URL', ''),
-
-  // Session nonce TTL in seconds (default 10 minutes)
-  SESSION_TTL_SECONDS: parseInt(optional_env('SESSION_TTL_SECONDS', '600'), 10),
 } as const;
 
 // Validate ADMIN_ID is a valid integer

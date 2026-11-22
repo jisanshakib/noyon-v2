@@ -31,7 +31,7 @@ export async function handleCancel(ctx: Context): Promise<void> {
 
   try {
     await cancelUser(userId);
-    clearSession(userId);
+    await clearSession(userId);
   } catch (err) {
     logger.error({ err, userId }, 'handleCancel: DB cancel failed');
   }
