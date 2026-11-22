@@ -1,7 +1,7 @@
 // src/handlers/qr.ts
 import { Context } from 'telegraf';
 import { getSession, getSessionLinkFromDb } from '../wallet.js';
-import { updateUser } from '../db.js';
+import { safeUpdateUser } from '../db.js';
 import { generateQrBuffer } from '../qr.js';
 import { KB } from '../keyboards.js';
 import { logger } from '../logger.js';
@@ -33,7 +33,7 @@ export async function handleGenerateQr(ctx: Context): Promise<void> {
     }
 
     const qrBuffer = await generateQrBuffer(pairingUri);
-    await updateUser(userId, { qr_generated: true, current_step: 'qr_shown' });
+    await safeUpdateUser(userId, { qr_generated: true, current_step: 'qr_shown' });
 
     await ctx.replyWithPhoto(
       { source: qrBuffer, filename: 'binance_pairing.png' },

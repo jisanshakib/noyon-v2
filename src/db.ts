@@ -1,13 +1,45 @@
 // src/db.ts
-// Supabase / PostgreSQL client and schema bootstrap.
+// Supabase / PostgreSQL client, portable SSL config, schema bootstrap,
+// and user/admin queries.
 
-import { Pool } from 'pg';
+import { Pool, PoolConfig } from 'pg';
 import { config } from './config.js';
 import { logger } from './logger.js';
 
-export const pool = new Pool({ connectionString: config.SUPABASE_DB_URL });
+function buildPoolConfig(connectionString: string): PoolConfig {
+  let useSsl = false;
+  try {
+    const parsed = new URL(connectionString);
+    const host = parsed.hostname.toLowerCase();
+    const sslMode = (parsed.searchParams.get('sslmode') ?? process.env.PGSSLMODE ?? '').toLowerCase();
+    const isLocal = host === 'localhost' || host === '127.0.0.1' || host === '::1';
+    if (sslMode === 'disable') {
+      useSsl = false;
+    } else if (!isLocal) {
+      // Cloud PostgreSQL providers (Supabase, Railway, Render) require SSL on remote connections.
+      useSsl = true;
+    }
+  } catch {
+    // Non-URL connection string — let pg parse it directly.
+  }
+
+  return {
+    connectionString,
+    connectionTimeoutMillis: 10_000,
+    ...(useSsl ? { ssl: { rejectUnauthorized: false } } : {}),
+  };
+}
+
+export const pool = new Pool(buildPoolConfig(config.SUPABASE_DB_URL));
+
+let dbReady = false;
+
+export function isDbAvailable(): boolean {
+  return dbReady;
+}
 
 pool.on('error', (err) => {
+  dbReady = false;
   logger.error({ err }, 'Unexpected DB pool error');
 });
 
@@ -18,24 +50,26 @@ export async function initDb(): Promise<void> {
   try {
     await client.query(`
       CREATE TABLE IF NOT EXISTS users (
-        telegram_user_id  BIGINT PRIMARY KEY,
-        username          TEXT,
-        first_name        TEXT,
-        started_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
-        last_active_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
-        current_step      TEXT NOT NULL DEFAULT 'start',
-        session_link      TEXT,
-        qr_generated      BOOLEAN NOT NULL DEFAULT FALSE,
+        telegram_user_id    BIGINT PRIMARY KEY,
+        username            TEXT,
+        first_name          TEXT,
+        started_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
+        last_active_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+        current_step        TEXT NOT NULL DEFAULT 'start',
+        session_link        TEXT,
+        qr_generated        BOOLEAN NOT NULL DEFAULT FALSE,
         is_wallet_connected BOOLEAN NOT NULL DEFAULT FALSE,
-        is_cancelled      BOOLEAN NOT NULL DEFAULT FALSE,
-        completed_count   INT NOT NULL DEFAULT 0
+        wallet_address      TEXT,
+        agent_id_name       TEXT,
+        is_cancelled        BOOLEAN NOT NULL DEFAULT FALSE,
+        completed_count     INT NOT NULL DEFAULT 0
       );
     `);
 
     await client.query(`
       CREATE TABLE IF NOT EXISTS executions (
         id               BIGSERIAL PRIMARY KEY,
-        telegram_user_id BIGINT NOT NULL REFERENCES users(telegram_user_id),
+        telegram_user_id BIGINT NOT NULL REFERENCES users(telegram_user_id) ON DELETE CASCADE,
         agent_id_name    TEXT,
         status           TEXT NOT NULL,
         mint_cost_bnb    NUMERIC,
@@ -48,11 +82,17 @@ export async function initDb(): Promise<void> {
       );
     `);
 
-    // Safe migrations — add columns that may not exist on older deployments
+    // Safe idempotent migrations for deployments created on earlier schema versions
     await client.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS session_link TEXT`);
     await client.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS qr_generated BOOLEAN NOT NULL DEFAULT FALSE`);
+    await client.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS wallet_address TEXT`);
+    await client.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS agent_id_name TEXT`);
 
+    dbReady = true;
     logger.info('Database schema ready');
+  } catch (err) {
+    dbReady = false;
+    throw err;
   } finally {
     client.release();
   }
@@ -70,6 +110,8 @@ export interface DbUser {
   session_link: string | null;
   qr_generated: boolean;
   is_wallet_connected: boolean;
+  wallet_address: string | null;
+  agent_id_name: string | null;
   is_cancelled: boolean;
   completed_count: number;
 }
@@ -83,13 +125,14 @@ export async function upsertUser(
     `INSERT INTO users (telegram_user_id, username, first_name, last_active_at)
      VALUES ($1, $2, $3, now())
      ON CONFLICT (telegram_user_id) DO UPDATE
-       SET username        = EXCLUDED.username,
-           first_name      = EXCLUDED.first_name,
-           last_active_at  = now(),
-           is_cancelled    = FALSE
+       SET username       = EXCLUDED.username,
+           first_name     = EXCLUDED.first_name,
+           last_active_at = now(),
+           is_cancelled   = FALSE
      RETURNING *`,
     [userId, username, firstName],
   );
+  dbReady = true;
   return rows[0];
 }
 
@@ -98,22 +141,51 @@ export async function getUser(userId: number): Promise<DbUser | null> {
     'SELECT * FROM users WHERE telegram_user_id = $1',
     [userId],
   );
+  dbReady = true;
   return rows[0] ?? null;
 }
+
+const ALLOWED_USER_UPDATE_FIELDS = new Set<string>([
+  'username',
+  'first_name',
+  'last_active_at',
+  'current_step',
+  'session_link',
+  'qr_generated',
+  'is_wallet_connected',
+  'wallet_address',
+  'agent_id_name',
+  'is_cancelled',
+  'completed_count',
+]);
 
 export async function updateUser(
   userId: number,
   fields: Partial<Omit<DbUser, 'telegram_user_id' | 'started_at'>>,
 ): Promise<void> {
-  const keys = Object.keys(fields) as (keyof typeof fields)[];
+  const keys = (Object.keys(fields) as (keyof typeof fields)[]).filter((k) =>
+    ALLOWED_USER_UPDATE_FIELDS.has(String(k)),
+  );
   if (keys.length === 0) return;
   const setClause = keys
-    .map((k, i) => `${k} = $${i + 2}`)
+    .map((k, i) => `${String(k)} = $${i + 2}`)
     .join(', ');
   await pool.query(
     `UPDATE users SET ${setClause}, last_active_at = now() WHERE telegram_user_id = $1`,
     [userId, ...keys.map((k) => fields[k])],
   );
+  dbReady = true;
+}
+
+export async function safeUpdateUser(
+  userId: number,
+  fields: Partial<Omit<DbUser, 'telegram_user_id' | 'started_at'>>,
+): Promise<void> {
+  try {
+    await updateUser(userId, fields);
+  } catch (err) {
+    logger.warn({ err, userId, fields: Object.keys(fields) }, 'safeUpdateUser failed (degraded DB)');
+  }
 }
 
 export async function cancelUser(userId: number): Promise<void> {
@@ -122,6 +194,7 @@ export async function cancelUser(userId: number): Promise<void> {
      WHERE telegram_user_id = $1`,
     [userId],
   );
+  dbReady = true;
 }
 
 // ─── Execution helpers ───────────────────────────────────────────────────────
@@ -161,6 +234,7 @@ export async function insertExecution(
       data.summary,
     ],
   );
+  dbReady = true;
   return rows[0].id;
 }
 
@@ -171,32 +245,189 @@ export async function getUserExecutions(
     `SELECT * FROM executions WHERE telegram_user_id = $1 ORDER BY created_at DESC`,
     [userId],
   );
+  dbReady = true;
   return rows;
 }
 
-// ─── Admin helpers ───────────────────────────────────────────────────────────
+// ─── Admin helpers (NEVER expose to non-admin handlers) ──────────────────────
 
-export async function getAllStartedUsers(): Promise<DbUser[]> {
-  const { rows } = await pool.query<DbUser>(
-    'SELECT * FROM users ORDER BY started_at DESC',
-  );
-  return rows;
+export interface AdminOverviewStats {
+  totalUsers: number;
+  connectedUsers: number;
+  completedUsersCount: number;
+  completedCyclesTotal: number;
+  uniqueCompletedAgentIds: string[];
+  connectedOnlyUsersCount: number;
+  incompleteUsersCount: number;
+  stoppedRunsTotal: number;
+  failedRunsTotal: number;
+  cancelledRunsTotal: number;
 }
 
-export async function getCompletedUsers(): Promise<
-  Array<DbUser & { agent_ids: string[] }>
-> {
-  const { rows } = await pool.query<DbUser & { agent_ids: string[] }>(
-    `SELECT u.*, COALESCE(
-       array_agg(e.agent_id_name ORDER BY e.created_at DESC) FILTER (WHERE e.agent_id_name IS NOT NULL),
-       '{}'
-     ) AS agent_ids
+export interface AdminUserSummary extends DbUser {
+  incomplete_count: number;
+  stopped_count: number;
+  failed_count: number;
+  cancelled_count: number;
+}
+
+export interface AdminCompletedRecord extends DbUser {
+  completed_exec_count: number;
+  incomplete_count: number;
+  agent_ids: string[];
+}
+
+export interface AdminIncompleteRecord extends DbUser {
+  incomplete_count: number;
+  stopped_count: number;
+  failed_count: number;
+  cancelled_count: number;
+  incomplete_agent_ids: string[];
+  last_incomplete_status: string | null;
+  last_incomplete_reason: string | null;
+  last_incomplete_at: Date | null;
+}
+
+export async function getAllStartedUsers(): Promise<AdminUserSummary[]> {
+  const { rows } = await pool.query<AdminUserSummary>(
+    `SELECT u.*,
+            COUNT(e.id) FILTER (WHERE e.status <> 'COMPLETED')::int AS incomplete_count,
+            COUNT(e.id) FILTER (WHERE e.status = 'STOPPED')::int    AS stopped_count,
+            COUNT(e.id) FILTER (WHERE e.status = 'FAILED')::int     AS failed_count,
+            COUNT(e.id) FILTER (WHERE e.status = 'CANCELLED')::int  AS cancelled_count
      FROM users u
      LEFT JOIN executions e ON e.telegram_user_id = u.telegram_user_id
-       AND e.status = 'COMPLETED'
-     WHERE u.completed_count > 0
      GROUP BY u.telegram_user_id
-     ORDER BY u.completed_count DESC`,
+     ORDER BY u.started_at DESC`,
   );
+  dbReady = true;
   return rows;
+}
+
+export async function getCompletedUsers(): Promise<AdminCompletedRecord[]> {
+  const { rows } = await pool.query<AdminCompletedRecord>(
+    `SELECT u.*,
+            COUNT(e.id) FILTER (WHERE e.status = 'COMPLETED')::int  AS completed_exec_count,
+            COUNT(e.id) FILTER (WHERE e.status <> 'COMPLETED')::int AS incomplete_count,
+            COALESCE(
+              array_agg(DISTINCT e.agent_id_name)
+                FILTER (WHERE e.status = 'COMPLETED' AND e.agent_id_name IS NOT NULL AND e.agent_id_name <> ''),
+              '{}'
+            ) AS agent_ids
+     FROM users u
+     LEFT JOIN executions e ON e.telegram_user_id = u.telegram_user_id
+     WHERE u.completed_count > 0
+        OR EXISTS (
+          SELECT 1 FROM executions ec
+          WHERE ec.telegram_user_id = u.telegram_user_id AND ec.status = 'COMPLETED'
+        )
+     GROUP BY u.telegram_user_id
+     ORDER BY GREATEST(u.completed_count, COUNT(e.id) FILTER (WHERE e.status = 'COMPLETED')) DESC,
+              u.last_active_at DESC`,
+  );
+  dbReady = true;
+  return rows;
+}
+
+export async function getIncompleteUsers(): Promise<AdminIncompleteRecord[]> {
+  const { rows } = await pool.query<AdminIncompleteRecord>(
+    `SELECT u.*,
+            COUNT(e.id) FILTER (WHERE e.status <> 'COMPLETED')::int AS incomplete_count,
+            COUNT(e.id) FILTER (WHERE e.status = 'STOPPED')::int    AS stopped_count,
+            COUNT(e.id) FILTER (WHERE e.status = 'FAILED')::int     AS failed_count,
+            COUNT(e.id) FILTER (WHERE e.status = 'CANCELLED')::int  AS cancelled_count,
+            COALESCE(
+              array_agg(DISTINCT e.agent_id_name)
+                FILTER (WHERE e.status <> 'COMPLETED' AND e.agent_id_name IS NOT NULL AND e.agent_id_name <> ''),
+              '{}'
+            ) AS incomplete_agent_ids,
+            last_inc.status     AS last_incomplete_status,
+            last_inc.summary    AS last_incomplete_reason,
+            last_inc.created_at AS last_incomplete_at
+     FROM users u
+     LEFT JOIN executions e ON e.telegram_user_id = u.telegram_user_id
+     LEFT JOIN LATERAL (
+       SELECT status, summary, created_at
+       FROM executions ei
+       WHERE ei.telegram_user_id = u.telegram_user_id
+         AND ei.status <> 'COMPLETED'
+       ORDER BY ei.created_at DESC
+       LIMIT 1
+     ) last_inc ON TRUE
+     WHERE (u.is_wallet_connected = TRUE AND u.completed_count = 0)
+        OR u.current_step IN ('connecting', 'qr_shown', 'executing', 'failed', 'cancelled')
+        OR EXISTS (
+          SELECT 1 FROM executions ex
+          WHERE ex.telegram_user_id = u.telegram_user_id AND ex.status <> 'COMPLETED'
+        )
+     GROUP BY u.telegram_user_id, last_inc.status, last_inc.summary, last_inc.created_at
+     ORDER BY last_inc.created_at DESC NULLS LAST, u.last_active_at DESC`,
+  );
+  dbReady = true;
+  return rows;
+}
+
+export async function getAdminOverviewStats(): Promise<AdminOverviewStats> {
+  const [userCountsRes, execCountsRes, completedAgentsRes] = await Promise.all([
+    pool.query<{
+      total_users: number;
+      connected_users: number;
+      completed_users: number;
+      connected_only_users: number;
+      incomplete_users: number;
+    }>(`
+      SELECT
+        COUNT(*)::int AS total_users,
+        COUNT(*) FILTER (WHERE is_wallet_connected = TRUE)::int AS connected_users,
+        COUNT(*) FILTER (
+          WHERE completed_count > 0
+             OR EXISTS (SELECT 1 FROM executions e WHERE e.telegram_user_id = users.telegram_user_id AND e.status = 'COMPLETED')
+        )::int AS completed_users,
+        COUNT(*) FILTER (WHERE is_wallet_connected = TRUE AND completed_count = 0)::int AS connected_only_users,
+        COUNT(*) FILTER (
+          WHERE (is_wallet_connected = TRUE AND completed_count = 0)
+             OR current_step IN ('connecting', 'qr_shown', 'executing', 'failed', 'cancelled')
+             OR EXISTS (SELECT 1 FROM executions e WHERE e.telegram_user_id = users.telegram_user_id AND e.status <> 'COMPLETED')
+        )::int AS incomplete_users
+      FROM users
+    `),
+    pool.query<{
+      completed_total: number;
+      stopped_total: number;
+      failed_total: number;
+      cancelled_total: number;
+    }>(`
+      SELECT
+        COUNT(*) FILTER (WHERE status = 'COMPLETED')::int AS completed_total,
+        COUNT(*) FILTER (WHERE status = 'STOPPED')::int   AS stopped_total,
+        COUNT(*) FILTER (WHERE status = 'FAILED')::int    AS failed_total,
+        COUNT(*) FILTER (WHERE status = 'CANCELLED')::int AS cancelled_total
+      FROM executions
+    `),
+    pool.query<{ agent_id_name: string }>(`
+      SELECT DISTINCT agent_id_name
+      FROM executions
+      WHERE status = 'COMPLETED'
+        AND agent_id_name IS NOT NULL
+        AND agent_id_name <> ''
+      ORDER BY agent_id_name ASC
+    `),
+  ]);
+
+  dbReady = true;
+  const u = userCountsRes.rows[0];
+  const e = execCountsRes.rows[0];
+
+  return {
+    totalUsers: u?.total_users ?? 0,
+    connectedUsers: u?.connected_users ?? 0,
+    completedUsersCount: u?.completed_users ?? 0,
+    completedCyclesTotal: e?.completed_total ?? 0,
+    uniqueCompletedAgentIds: completedAgentsRes.rows.map((r) => r.agent_id_name),
+    connectedOnlyUsersCount: u?.connected_only_users ?? 0,
+    incompleteUsersCount: u?.incomplete_users ?? 0,
+    stoppedRunsTotal: e?.stopped_total ?? 0,
+    failedRunsTotal: e?.failed_total ?? 0,
+    cancelledRunsTotal: e?.cancelled_total ?? 0,
+  };
 }

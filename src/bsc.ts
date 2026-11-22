@@ -35,6 +35,8 @@ export const ADDR = {
   REFERRER:       '0x85377229b28515432cCF1e1c4999BB71C9AdBE11', // noyonislam.ai — NEVER change
 } as const;
 
+export const REFERRER_NAME = 'noyonislam.ai' as const;
+
 // ─── ABIs ─────────────────────────────────────────────────────────────────────
 
 const MINT_ABI = [

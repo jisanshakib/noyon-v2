@@ -6,7 +6,8 @@
 -- ============================================================
 
 -- ── Users ─────────────────────────────────────────────────────────────────────
--- One row per Telegram user. Tracks wallet connection state and job count.
+-- One row per Telegram user. Tracks wallet connection state, bound Agent ID,
+-- wallet address, and completed job count.
 
 CREATE TABLE IF NOT EXISTS users (
   telegram_user_id    BIGINT      PRIMARY KEY,
@@ -17,25 +18,29 @@ CREATE TABLE IF NOT EXISTS users (
   current_step        TEXT        NOT NULL DEFAULT 'start',
   -- current_step values:
   --   start | connecting | qr_shown | connected | executing | completed | failed | cancelled
-  session_link        TEXT,       -- Real pairing deep-link URI (from Binance SDK / BINANCE_WALLET_PAIRING_BASE_URL)
+  session_link        TEXT,       -- Pairing deep-link URI from @binance/agentic-wallet (baw)
   qr_generated        BOOLEAN     NOT NULL DEFAULT FALSE,
   is_wallet_connected BOOLEAN     NOT NULL DEFAULT FALSE,  -- TRUE only after markSessionConnected() succeeds
+  wallet_address      TEXT,       -- Bound BSC 0x wallet address from baw
+  agent_id_name       TEXT,       -- Bound SPACE ID *.ai Agent ID (if claimed)
   is_cancelled        BOOLEAN     NOT NULL DEFAULT FALSE,
   completed_count     INT         NOT NULL DEFAULT 0
 );
 
--- Migration: add columns if schema was created before this version
--- (safe to run multiple times — IF NOT EXISTS / DO NOTHING patterns)
+-- Safe migrations for existing deployments (idempotent)
 ALTER TABLE users ADD COLUMN IF NOT EXISTS session_link TEXT;
 ALTER TABLE users ADD COLUMN IF NOT EXISTS qr_generated BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS wallet_address TEXT;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS agent_id_name TEXT;
 
--- Index for admin "last active" queries
+-- Indexes for admin & status queries
 CREATE INDEX IF NOT EXISTS idx_users_last_active ON users (last_active_at DESC);
 CREATE INDEX IF NOT EXISTS idx_users_completed   ON users (completed_count DESC) WHERE completed_count > 0;
 CREATE INDEX IF NOT EXISTS idx_users_connected   ON users (is_wallet_connected) WHERE is_wallet_connected = TRUE;
+CREATE INDEX IF NOT EXISTS idx_users_agent_id    ON users (agent_id_name) WHERE agent_id_name IS NOT NULL;
 
 -- ── Executions ────────────────────────────────────────────────────────────────
--- One row per mint/approve/sell pipeline run (all statuses).
+-- One row per mint/approve/sell pipeline attempt (COMPLETED, STOPPED, FAILED, CANCELLED).
 
 CREATE TABLE IF NOT EXISTS executions (
   id               BIGSERIAL   PRIMARY KEY,
@@ -47,7 +52,7 @@ CREATE TABLE IF NOT EXISTS executions (
   sell_bnb         NUMERIC(30, 18),            -- BNB received from PancakeSwap sell
   pnl_or_fee       NUMERIC(30, 18),            -- sell_bnb − mint_cost_bnb (negative = loss)
   tx_hashes        JSONB,                      -- { "mint": "0x...", "approve": "0x...", "sell": "0x..." }
-  summary          TEXT,                       -- AI-generated summary or stop reason
+  summary          TEXT,                       -- AI-generated summary or stop/failure reason
   created_at       TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 

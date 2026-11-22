@@ -1,8 +1,8 @@
 // src/handlers/execute.ts — Layer 4: /mint handler with live single-message updates
 import { Context } from 'telegraf';
-import { isSessionConnectedDb, getSession } from '../wallet.js';
-import { isUserLocked, requestCancelExecution, runFullExecution } from '../executor.js';
-import { updateUser, getUser } from '../db.js';
+import { isSessionConnectedDb } from '../wallet.js';
+import { isUserLocked, runFullExecution } from '../executor.js';
+import { safeUpdateUser, getUser } from '../db.js';
 import { KB } from '../keyboards.js';
 import { config } from '../config.js';
 import { logger } from '../logger.js';
@@ -52,20 +52,20 @@ export async function handleCompleteProcess(ctx: Context): Promise<void> {
     } catch { /* message may already be deleted or identical — ignore */ }
   };
 
-  await updateUser(userId, { current_step: 'executing' });
+  await safeUpdateUser(userId, { current_step: 'executing' });
 
   // Run asynchronously so the bot stays responsive
   runFullExecution(userId, onStatus)
     .then(async (result) => {
       if (result.ok) {
-        await updateUser(userId, { current_step: 'completed' });
+        await safeUpdateUser(userId, { current_step: 'completed' });
         await notifyAdmin(ctx, userId, result.agentId, result);
         // Replace live status with final clean report
         await ctx.telegram.editMessageText(chatId, messageId, undefined, result.summary, {
           reply_markup: KB.postExecution.reply_markup,
         });
       } else {
-        await updateUser(userId, { current_step: result.isSessionExpired ? 'connecting' : 'failed' });
+        await safeUpdateUser(userId, { current_step: result.isSessionExpired ? 'connecting' : 'failed' });
 
         const partialInfo = result.partialTxHashes
           ? Object.entries(result.partialTxHashes).map(([k, v]) => `  ${k}: ${v}`).join('\n')
@@ -94,17 +94,31 @@ async function notifyAdmin(
   agentId: string,
   result: { mintCostBnb: string; sellBnb: string; pnlOrFee: string; mintTxHash: string },
 ): Promise<void> {
+  let user = null;
   try {
-    const user = await getUser(userId);
-    const name = user?.first_name ?? user?.username ?? String(userId);
-    await ctx.telegram.sendMessage(
-      config.ADMIN_ID,
-      `Job Completed\n\nUser: ${name} (ID: ${userId})\nAgent ID: ${agentId}\n` +
-      `Mint cost: ${result.mintCostBnb} BNB\nSell: ${result.sellBnb} BNB\n` +
-      `PnL: ${result.pnlOrFee} BNB\nMint TX: ${result.mintTxHash}\n` +
-      `Total completed: ${(user?.completed_count ?? 0) + 1}`,
-    );
+    user = await getUser(userId);
   } catch (err) {
-    logger.warn({ err }, 'Failed to notify admin');
+    logger.warn({ err, userId }, 'notifyAdmin: failed to load user record');
+  }
+
+  const name = user?.first_name ?? user?.username ?? String(userId);
+  // Note: executor.logExecution already incremented completed_count before returning ok=true.
+  const totalCompleted = user?.completed_count ?? 1;
+  const text =
+    `✅ Job Completed\n\n` +
+    `User: ${name} (ID: ${userId})\n` +
+    `Agent ID: ${agentId}\n` +
+    `Mint cost: ${result.mintCostBnb} BNB\n` +
+    `Sell: ${result.sellBnb} BNB\n` +
+    `PnL: ${result.pnlOrFee} BNB\n` +
+    `Mint TX: ${result.mintTxHash}\n` +
+    `Total completed by user: ${totalCompleted}`;
+
+  for (const adminId of config.ADMIN_IDS) {
+    try {
+      await ctx.telegram.sendMessage(adminId, text);
+    } catch (err) {
+      logger.warn({ err, adminId }, 'Failed to notify admin');
+    }
   }
 }

@@ -21,13 +21,13 @@
 
 import { ethers } from 'ethers';
 import {
-  readCostOf, readBnbBalance, readAiBalance,
+  readCostOf, readBnbBalance, readAiBalance, readSpaceIdName,
   runPreflightChecks, simulateSellOutput,
   buildMintCalldata, buildApproveCalldata, buildSellCalldata,
   isMintRaceError, ADDR,
 } from './bsc.js';
 import {
-  isSessionConnectedDb, executeContractCall, getSession,
+  isSessionConnectedDb, executeContractCall, getSession, syncAgentId,
 } from './wallet.js';
 import { generateExecutionSummary } from './gemini.js';
 import { insertExecution, pool } from './db.js';
@@ -89,6 +89,8 @@ export async function runFullExecution(
   cancelFlags.set(userId, false);
 
   const txHashes: Partial<Record<'mint' | 'approve' | 'sell', string>> = {};
+  let resolvedWallet = '';
+  let resolvedAgentId = '';
 
   try {
     // ── 1. Verify wallet session (Supabase-authoritative) ─────────────────────
@@ -99,8 +101,18 @@ export async function runFullExecution(
       return { ok: false, reason: 'Wallet not connected. Tap Connect Wallet and complete pairing first.' };
     }
 
+    resolvedWallet = walletAddress;
     const session = getSession(userId);
-    const agentId = session?.agentIdName ?? walletAddress;
+    let agentId = session?.agentIdName?.trim() || '';
+    if (!agentId) {
+      const onChainName = (await readSpaceIdName(walletAddress)).trim();
+      if (onChainName) {
+        agentId = onChainName;
+        await syncAgentId(userId, onChainName);
+      }
+    }
+    resolvedAgentId = agentId || walletAddress;
+    agentId = resolvedAgentId;
 
     // ── 2. Read live mint cost ────────────────────────────────────────────────
     await onStatus('📡 Reading live mint cost from chain…');
@@ -110,11 +122,15 @@ export async function runFullExecution(
     await onStatus('🛡 Running preflight checks…');
     const preflight = await runPreflightChecks(walletAddress, mintCostWei);
     if (!preflight.ok) {
-      return { ok: false, reason: `⛔ ${preflight.reason!}` };
+      const reason = preflight.reason ?? 'Preflight check failed.';
+      await logExecution(userId, walletAddress, 'STOPPED', 0n, 0n, 0n, txHashes, agentId, reason);
+      return { ok: false, reason: `⛔ ${reason}` };
     }
 
     if (isCancelled(userId)) {
-      return { ok: false, reason: 'Cancelled by user before execution started.' };
+      const cancelReason = 'Cancelled by user before execution started.';
+      await logExecution(userId, walletAddress, 'CANCELLED', 0n, 0n, 0n, txHashes, agentId, cancelReason);
+      return { ok: false, reason: cancelReason };
     }
 
     // ── 4. MINT (with race retry) ─────────────────────────────────────────────
@@ -157,8 +173,10 @@ export async function runFullExecution(
       } catch (err) {
         const e = err as Error & { isSessionExpired?: boolean };
         if (e.isSessionExpired) {
+          const expReason = 'Binance Wallet session expired during mint. Please reconnect.';
+          await logExecution(userId, walletAddress, 'FAILED', 0n, 0n, 0n, txHashes, agentId, expReason);
           return { ok: false, isSessionExpired: true,
-            reason: 'Binance Wallet session expired during mint. Please reconnect.',
+            reason: expReason,
             partialTxHashes: txHashes };
         }
         if (isMintRaceError(err)) {
@@ -167,15 +185,18 @@ export async function runFullExecution(
             await onStatus(`⚡ Mint race detected — retrying (${mintAttempt}/${MAX_MINT_RETRIES})…`);
             continue;
           }
-          return { ok: false, reason: `Mint failed after ${MAX_MINT_RETRIES} attempts due to chain congestion. Please try again.`, partialTxHashes: txHashes };
+          const raceReason = `Mint failed after ${MAX_MINT_RETRIES} attempts due to chain congestion. Please try again.`;
+          await logExecution(userId, walletAddress, 'FAILED', 0n, 0n, 0n, txHashes, agentId, raceReason);
+          return { ok: false, reason: raceReason, partialTxHashes: txHashes };
         }
         throw err; // other errors bubble up
       }
     }
 
     if (isCancelled(userId)) {
-      await logExecution(userId, walletAddress, 'CANCELLED', actualMintCost, tokensReceived, 0n, txHashes, agentId);
-      return { ok: false, reason: `Cancelled after mint. Mint TX: ${mintTxHash} already broadcast.`, partialTxHashes: txHashes };
+      const cancelReason = `Cancelled after mint. Mint TX: ${mintTxHash} already broadcast.`;
+      await logExecution(userId, walletAddress, 'CANCELLED', actualMintCost, tokensReceived, 0n, txHashes, agentId, cancelReason);
+      return { ok: false, reason: cancelReason, partialTxHashes: txHashes };
     }
 
     // ── 5. Post-mint 8% stop-loss check ──────────────────────────────────────
@@ -210,8 +231,9 @@ export async function runFullExecution(
     txHashes.approve = approveResult.txHash;
 
     if (isCancelled(userId)) {
-      await logExecution(userId, walletAddress, 'CANCELLED', actualMintCost, tokensReceived, 0n, txHashes, agentId);
-      return { ok: false, reason: `Cancelled after approve. Mint: ${mintTxHash}, Approve: ${approveResult.txHash}`, partialTxHashes: txHashes };
+      const cancelReason = `Cancelled after approve. Mint: ${mintTxHash}, Approve: ${approveResult.txHash}`;
+      await logExecution(userId, walletAddress, 'CANCELLED', actualMintCost, tokensReceived, 0n, txHashes, agentId, cancelReason);
+      return { ok: false, reason: cancelReason, partialTxHashes: txHashes };
     }
 
     // ── 7. SELL ───────────────────────────────────────────────────────────────
@@ -269,11 +291,13 @@ export async function runFullExecution(
     const msg = e.message ?? String(err);
     logger.error({ userId, err: msg }, 'Execution failed');
     if (e.isSessionExpired) {
+      const expReason = `Binance Wallet session expired during ${e.step ?? 'execution'}. Please reconnect and try again.`;
+      await logExecution(userId, resolvedWallet, 'FAILED', 0n, 0n, 0n, txHashes, resolvedAgentId, expReason).catch(() => {});
       return { ok: false, isSessionExpired: true,
-        reason: `Binance Wallet session expired during ${e.step ?? 'execution'}. Please reconnect and try again.`,
+        reason: expReason,
         partialTxHashes: txHashes };
     }
-    await logExecution(userId, '', 'FAILED', 0n, 0n, 0n, txHashes, '').catch(() => {});
+    await logExecution(userId, resolvedWallet, 'FAILED', 0n, 0n, 0n, txHashes, resolvedAgentId, msg.slice(0, 300)).catch(() => {});
     return { ok: false, reason: `Execution failed: ${msg}`, partialTxHashes: txHashes };
 
   } finally {

@@ -17,17 +17,43 @@
 import { spawn }    from 'child_process';
 import * as path    from 'path';
 import * as fs      from 'fs';
-import * as os      from 'os';
+import { config }   from './config.js';
 import { logger }   from './logger.js';
 import { pool }     from './db.js';
 
-// ─── baw binary path ─────────────────────────────────────────────────────────
-const BAW_BIN = path.resolve(
-  __dirname, '..', 'node_modules', '@binance', 'agentic-wallet', 'dist', 'index.js',
-);
+// ─── baw binary path (portable across npm layouts & OSes) ───────────────────
+function resolveBawBin(): string {
+  const localCandidate = path.resolve(
+    __dirname, '..', 'node_modules', '@binance', 'agentic-wallet', 'dist', 'index.js',
+  );
+  if (fs.existsSync(localCandidate)) return localCandidate;
+
+  try {
+    const pkgPath = require.resolve('@binance/agentic-wallet/package.json');
+    const pkgDir  = path.dirname(pkgPath);
+    const pkg     = JSON.parse(fs.readFileSync(pkgPath, 'utf8')) as {
+      bin?: string | Record<string, string>;
+      main?: string;
+    };
+    const relBin = typeof pkg.bin === 'string'
+      ? pkg.bin
+      : pkg.bin?.baw ?? Object.values(pkg.bin ?? {})[0] ?? pkg.main ?? 'dist/index.js';
+    const resolved = path.resolve(pkgDir, relBin);
+    if (fs.existsSync(resolved)) return resolved;
+  } catch {
+    // Package not installed — bawAvailable() will report false
+  }
+  return localCandidate;
+}
+
+const BAW_BIN = resolveBawBin();
 
 export function bawAvailable(): boolean {
   return fs.existsSync(BAW_BIN);
+}
+
+export function getBawBinPath(): string {
+  return BAW_BIN;
 }
 
 // ─── Types ───────────────────────────────────────────────────────────────────
@@ -58,12 +84,25 @@ export async function callBaw(
   userId?: number,
   timeoutMs = 30_000,
 ): Promise<unknown> {
+  if (!bawAvailable()) {
+    throw new Error(
+      `@binance/agentic-wallet CLI binary not found at ${BAW_BIN}. Run "npm ci" or "npm install" before starting.`,
+    );
+  }
+
   return new Promise((resolve, reject) => {
     const userHome = userId != null
-      ? path.join(os.homedir(), '.baw-sessions', String(userId))
-      : os.homedir();
+      ? path.join(config.BAW_SESSION_ROOT, String(userId))
+      : config.BAW_SESSION_ROOT;
 
-    fs.mkdirSync(userHome, { recursive: true });
+    try {
+      fs.mkdirSync(userHome, { recursive: true });
+    } catch (mkdirErr) {
+      return reject(new Error(
+        `Cannot create baw session directory (${userHome}): ${(mkdirErr as Error).message}. ` +
+        `Set BAW_SESSION_ROOT to a writable directory.`,
+      ));
+    }
 
     const child = spawn(
       process.execPath,
@@ -81,6 +120,11 @@ export async function callBaw(
       child.kill('SIGTERM');
       reject(new Error(`baw [${args.join(' ')}] timed out after ${timeoutMs / 1000}s`));
     }, timeoutMs);
+
+    child.on('error', (spawnErr) => {
+      clearTimeout(timer);
+      reject(new Error(`Failed to launch baw CLI: ${spawnErr.message}`));
+    });
 
     child.on('close', (code) => {
       clearTimeout(timer);
@@ -155,11 +199,15 @@ export async function generatePairingUri(userId: number): Promise<WalletSession 
     const session: WalletSession = { qrCodeId, urlForWeb, expireAt, pairingCode };
     sessions.set(userId, session);
 
-    await pool.query(
-      `UPDATE users SET session_link=$2, is_wallet_connected=FALSE,
-       current_step='connecting', last_active_at=now() WHERE telegram_user_id=$1`,
-      [userId, urlForWeb],
-    );
+    try {
+      await pool.query(
+        `UPDATE users SET session_link=$2, is_wallet_connected=FALSE,
+         current_step='connecting', last_active_at=now() WHERE telegram_user_id=$1`,
+        [userId, urlForWeb],
+      );
+    } catch (dbErr) {
+      logger.warn({ dbErr, userId }, 'generatePairingUri: DB update failed (continuing with in-memory session)');
+    }
 
     logger.info({ userId, qrCodeId, expireAt }, 'baw auth signin ok');
     return session;
@@ -242,7 +290,7 @@ export function verifyAndBindSession(
   })();
 }
 
-/** Marks connected in memory + Supabase. */
+/** Marks connected in memory + Supabase (stores bound wallet address & Agent ID). */
 export async function markSessionConnected(
   userId: number,
   walletAddress: string,
@@ -253,15 +301,45 @@ export async function markSessionConnected(
   if (!addr) throw new Error('markSessionConnected: walletAddress is required');
 
   const existing = sessions.get(userId);
-  sessions.set(userId, { ...(existing ?? { qrCodeId: '', urlForWeb: '', expireAt: 0 }),
-    walletAddress: addr, agentIdName: agent || undefined });
+  sessions.set(userId, {
+    ...(existing ?? { qrCodeId: '', urlForWeb: '', expireAt: 0 }),
+    walletAddress: addr,
+    agentIdName: agent || undefined,
+  });
 
-  await pool.query(
-    `UPDATE users SET is_wallet_connected=TRUE, current_step='connected',
-     last_active_at=now() WHERE telegram_user_id=$1`,
-    [userId],
-  );
-  logger.info({ userId, addr, agent }, 'Session bound to Supabase');
+  try {
+    await pool.query(
+      `UPDATE users
+       SET is_wallet_connected = TRUE,
+           wallet_address      = $2,
+           agent_id_name       = COALESCE(NULLIF($3, ''), agent_id_name),
+           current_step        = 'connected',
+           last_active_at      = now()
+       WHERE telegram_user_id = $1`,
+      [userId, addr, agent],
+    );
+    logger.info({ userId, addr, agent }, 'Session bound to Supabase');
+  } catch (dbErr) {
+    logger.warn({ dbErr, userId, addr, agent }, 'markSessionConnected: DB update failed (session active in memory)');
+  }
+}
+
+/** Updates bound *.ai Agent ID in memory + Supabase once resolved on-chain. */
+export async function syncAgentId(userId: number, agentIdName: string): Promise<void> {
+  const clean = agentIdName.trim();
+  if (!clean) return;
+  const existing = sessions.get(userId);
+  if (existing && !existing.agentIdName) {
+    existing.agentIdName = clean;
+  }
+  try {
+    await pool.query(
+      `UPDATE users SET agent_id_name = $2, last_active_at = now() WHERE telegram_user_id = $1`,
+      [userId, clean],
+    );
+  } catch (dbErr) {
+    logger.warn({ dbErr, userId }, 'syncAgentId: DB update failed');
+  }
 }
 
 // ─── Session queries ──────────────────────────────────────────────────────────
@@ -281,16 +359,42 @@ export function isSessionConnected(userId: number): boolean {
 
 export async function isSessionConnectedDb(userId: number): Promise<{ connected: boolean; address?: string }> {
   try {
-    const { rows } = await pool.query<{ is_wallet_connected: boolean }>(
-      'SELECT is_wallet_connected FROM users WHERE telegram_user_id=$1', [userId],
+    const { rows } = await pool.query<{
+      is_wallet_connected: boolean;
+      wallet_address: string | null;
+      agent_id_name: string | null;
+    }>(
+      'SELECT is_wallet_connected, wallet_address, agent_id_name FROM users WHERE telegram_user_id=$1',
+      [userId],
     );
-    if (!rows.length || !rows[0].is_wallet_connected) return { connected: false };
+    if (!rows.length || !rows[0].is_wallet_connected) {
+      const mem = sessions.get(userId);
+      return mem?.walletAddress ? { connected: true, address: mem.walletAddress } : { connected: false };
+    }
     // Restore from baw if memory is cold
-    if (!sessions.get(userId)?.walletAddress) await refreshSessionFromBaw(userId);
-    return { connected: true, address: sessions.get(userId)?.walletAddress };
+    if (!sessions.get(userId)?.walletAddress) {
+      const refreshed = await refreshSessionFromBaw(userId);
+      if (refreshed?.walletAddress) {
+        // Keep DB wallet_address / agent_id_name synchronized
+        await markSessionConnected(userId, refreshed.walletAddress, refreshed.agentIdName ?? rows[0].agent_id_name ?? '');
+      } else if (rows[0].wallet_address) {
+        sessions.set(userId, {
+          qrCodeId: '',
+          urlForWeb: '',
+          expireAt: Date.now() + 86_400_000,
+          walletAddress: rows[0].wallet_address,
+          agentIdName: rows[0].agent_id_name ?? undefined,
+        });
+      }
+    }
+    return {
+      connected: true,
+      address: sessions.get(userId)?.walletAddress ?? rows[0].wallet_address ?? undefined,
+    };
   } catch (dbErr) {
-    logger.error({ dbErr, userId }, 'isSessionConnectedDb failed');
-    return { connected: isSessionConnected(userId) };
+    logger.error({ dbErr, userId }, 'isSessionConnectedDb failed — falling back to in-memory session');
+    const mem = sessions.get(userId);
+    return { connected: !!mem?.walletAddress, address: mem?.walletAddress };
   }
 }
 

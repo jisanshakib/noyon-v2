@@ -4,18 +4,40 @@
 import { Markup } from 'telegraf';
 
 export const KB = {
-  /** Shown on /start */
+  /** Shown on /start for normal users */
   start: Markup.inlineKeyboard([
     [Markup.button.callback('🔗 Connect Your Binance Wallet', 'connect_wallet')],
     [Markup.button.callback('📱 Generate QR Code', 'generate_qr')],
-    [Markup.button.callback('📋 My Completed Jobs & Agent IDs', 'my_jobs')],
+    [Markup.button.callback('📊 My Status & Jobs', 'my_jobs')],
     [Markup.button.callback('❌ Cancel', 'cancel')],
+  ]),
+
+  /** Shown on /start ONLY for configured ADMIN_ID(s) */
+  startForAdmin: Markup.inlineKeyboard([
+    [Markup.button.callback('🔗 Connect Your Binance Wallet', 'connect_wallet')],
+    [Markup.button.callback('📱 Generate QR Code', 'generate_qr')],
+    [Markup.button.callback('📊 My Status & Jobs', 'my_jobs')],
+    [Markup.button.callback('🛡️ Admin Dashboard', 'admin_overview')],
+    [Markup.button.callback('❌ Cancel', 'cancel')],
+  ]),
+
+  /** Admin dashboard navigation (strictly gated by ADMIN_ID check in handlers) */
+  adminMenu: Markup.inlineKeyboard([
+    [
+      Markup.button.callback('🏆 Completed Agent IDs', 'admin_completed'),
+      Markup.button.callback('⚠️ Incomplete / Connected', 'admin_incomplete'),
+    ],
+    [
+      Markup.button.callback('👥 All Users', 'admin_users'),
+      Markup.button.callback('🔄 Refresh Overview', 'admin_overview'),
+    ],
   ]),
 
   /** Shown after wallet connection link is generated */
   afterConnect: Markup.inlineKeyboard([
     [Markup.button.callback('📱 Generate QR Code', 'generate_qr')],
     [Markup.button.callback('🚀 Complete All Process', 'complete_process')],
+    [Markup.button.callback('📊 My Status & Jobs', 'my_jobs')],
     [Markup.button.callback('❌ Cancel', 'cancel')],
   ]),
 
@@ -33,7 +55,7 @@ export const KB = {
   /** Shown after completion / error */
   postExecution: Markup.inlineKeyboard([
     [Markup.button.callback('🚀 Complete All Process', 'complete_process')],
-    [Markup.button.callback('📋 My Completed Jobs & Agent IDs', 'my_jobs')],
+    [Markup.button.callback('📊 My Status & Jobs', 'my_jobs')],
     [Markup.button.callback('❌ Cancel', 'cancel')],
   ]),
 };

@@ -1,8 +1,12 @@
 // src/handlers/wallet.ts — /connect flow with live QR + background verification
 import { Context } from 'telegraf';
-import { generatePairingUri, verifyAndBindSession, getSession, getSessionLinkFromDb } from '../wallet.js';
+import {
+  bawAvailable,
+  generatePairingUri,
+  verifyAndBindSession,
+} from '../wallet.js';
 import { generateQrBuffer } from '../qr.js';
-import { updateUser } from '../db.js';
+import { safeUpdateUser } from '../db.js';
 import { KB } from '../keyboards.js';
 import { logger } from '../logger.js';
 
@@ -15,14 +19,23 @@ export async function handleConnectWallet(ctx: Context): Promise<void> {
   if (!userId) return;
   await safeAnswerCb(ctx, 'Starting pairing…');
 
+  if (!bawAvailable()) {
+    await ctx.reply(
+      '❌ Binance Agentic Wallet CLI (@binance/agentic-wallet) is not installed on this server.\n\n' +
+      'Ask the bot operator to run "npm ci" and restart the service.',
+      KB.start,
+    );
+    return;
+  }
+
   try {
     const session = await generatePairingUri(userId);
 
     if (!session) {
       await ctx.reply(
         '❌ Failed to start Binance Wallet pairing.\n\n' +
-        'The @binance/agentic-wallet CLI failed to reach the Binance auth endpoint.\n' +
-        'Check server logs and ensure the deployment has internet access.',
+        'The @binance/agentic-wallet CLI could not create a pairing session.\n' +
+        'Check server logs and ensure the deployment has outbound internet access.',
         KB.start,
       );
       return;
@@ -31,7 +44,7 @@ export async function handleConnectWallet(ctx: Context): Promise<void> {
     // Handle already-connected case
     if (session.walletAddress) {
       await ctx.reply(
-        `Already connected!\n\nAddress: ${session.walletAddress}\n` +
+        `✅ Already connected!\n\nAddress: ${session.walletAddress}\n` +
         (session.agentIdName ? `Agent ID: ${session.agentIdName}\n` : '') +
         '\nTap Complete All Process to run the cycle.',
         KB.afterConnect,
@@ -39,12 +52,12 @@ export async function handleConnectWallet(ctx: Context): Promise<void> {
       return;
     }
 
-    await updateUser(userId, { session_link: session.urlForWeb, current_step: 'connecting' });
+    await safeUpdateUser(userId, { session_link: session.urlForWeb, current_step: 'connecting' });
 
     const expiresMin = Math.max(1, Math.round((session.expireAt - Date.now()) / 60000));
 
     // Generate QR image immediately
-    let qrCaption = `🔗 Open in Binance app:\n${session.urlForWeb}`;
+    const qrCaption = `🔗 Open in Binance app:\n${session.urlForWeb}`;
     try {
       const qrBuf = await generateQrBuffer(session.urlForWeb);
       await ctx.replyWithPhoto(
@@ -85,39 +98,8 @@ export async function handleConnectWallet(ctx: Context): Promise<void> {
         } catch (e) { logger.warn({ e, userId }, 'Could not send failed message'); }
       },
     );
-
   } catch (err) {
     logger.error({ err, userId }, 'handleConnectWallet error');
     await ctx.reply('❌ Failed to start pairing. Please try again.', KB.start);
-  }
-}
-
-export async function handleGenerateQr(ctx: Context): Promise<void> {
-  const userId = ctx.from?.id;
-  if (!userId) return;
-  await safeAnswerCb(ctx, 'Generating QR…');
-
-  try {
-    // Resolution: memory → Supabase → error
-    let uri = getSession(userId)?.urlForWeb ?? null;
-    if (!uri) uri = await getSessionLinkFromDb(userId);
-
-    if (!uri) {
-      await ctx.reply(
-        '⚠️ No pairing link found.\nTap Connect Your Binance Wallet first.',
-        KB.start,
-      );
-      return;
-    }
-
-    const qrBuf = await generateQrBuffer(uri);
-    await updateUser(userId, { qr_generated: true, current_step: 'qr_shown' });
-    await ctx.replyWithPhoto(
-      { source: qrBuf, filename: 'connect.png' },
-      { caption: '📱 Scan with your Binance app.\n\nWaiting for approval…', ...KB.afterQr },
-    );
-  } catch (err) {
-    logger.error({ err, userId }, 'handleGenerateQr error');
-    await ctx.reply('❌ Failed to generate QR. Please try again.', KB.start);
   }
 }

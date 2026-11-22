@@ -34,7 +34,7 @@ const INTENT_TOOLS = [
   {
     type: 'function' as const,
     name: 'my_jobs',
-    description: 'User wants to see their completed jobs and Agent IDs.',
+    description: 'User wants to see their own status, completed jobs, incomplete/failed attempts, or bound Agent IDs.',
     parameters: { type: 'object', properties: {}, required: [] },
   },
   {
@@ -77,7 +77,10 @@ Never ask the user for seed phrases, private keys, or to send BNB directly to an
 Be concise, friendly, and security-conscious.
 Always respond in the same language the user writes in.`;
 
-// ─── Intent routing ───────────────────────────────────────────────────────────
+function isGeminiRateLimitError(err: unknown): boolean {
+  const msg = String((err as Error)?.message ?? err ?? '');
+  return /429|RESOURCE_EXHAUSTED|quota|rate.?limit/i.test(msg);
+}
 
 /**
  * Routes a user message to an intent using Gemini function calling.
@@ -124,6 +127,13 @@ export async function routeIntent(
     const text = response.output_text ?? 'How can I help you?';
     return { intent: 'general_reply', reply: text };
   } catch (err) {
+    if (isGeminiRateLimitError(err)) {
+      logger.warn({ err }, 'Gemini free-tier rate limit / quota reached in routeIntent');
+      return {
+        intent: 'general_reply',
+        reply: 'AI assistant is temporarily rate-limited. Please use the buttons below directly.',
+      };
+    }
     logger.error({ err }, 'Gemini routeIntent failed');
     return { intent: 'general_reply', reply: 'Sorry, I had trouble understanding that. Please use the buttons below.' };
   }
@@ -166,7 +176,7 @@ Data:
 - Sell TX: ${data.sellTxHash}
 ${data.stopReason ? `- Stop reason: ${data.stopReason}` : ''}
 
-Keep it under 300 words. Use Telegram MarkdownV2 formatting.`;
+Keep it under 250 words. Use clean plain text only (no Markdown, asterisks, backticks, or HTML tags).`;
 
     const response = await ai.interactions.create({
       model: 'gemini-3.8-flash',
@@ -174,24 +184,28 @@ Keep it under 300 words. Use Telegram MarkdownV2 formatting.`;
       store: false,
     });
 
-    return response.output_text ?? buildFallbackSummary(data);
+    return response.output_text?.trim() || buildFallbackSummary(data);
   } catch (err) {
-    logger.error({ err }, 'generateExecutionSummary failed');
+    if (isGeminiRateLimitError(err)) {
+      logger.warn({ err }, 'Gemini free-tier rate limit / quota reached in generateExecutionSummary — using deterministic fallback');
+    } else {
+      logger.error({ err }, 'generateExecutionSummary failed — using deterministic fallback');
+    }
     return buildFallbackSummary(data);
   }
 }
 
 function buildFallbackSummary(data: ExecutionSummaryInput): string {
   const lines = [
-    `*Execution ${data.status}*`,
-    `🤖 Agent: \`${data.agentId}\``,
+    `Execution ${data.status}`,
+    `🤖 Agent ID: ${data.agentId}`,
     `💰 Mint Cost: ${data.mintCostBnb} BNB`,
     `🪙 AI Tokens: ${data.tokensReceived}`,
     `💵 Sale Proceeds: ${data.sellBnb} BNB`,
     `📊 P&L: ${data.pnlOrFee} BNB`,
-    `📋 Mint TX: \`${data.mintTxHash}\``,
-    `✅ Approve TX: \`${data.approveTxHash}\``,
-    `💱 Sell TX: \`${data.sellTxHash}\``,
+    `📋 Mint TX: ${data.mintTxHash}`,
+    `✅ Approve TX: ${data.approveTxHash}`,
+    `💱 Sell TX: ${data.sellTxHash}`,
   ];
   if (data.stopReason) lines.push(`⚠️ Stopped: ${data.stopReason}`);
   return lines.join('\n');
