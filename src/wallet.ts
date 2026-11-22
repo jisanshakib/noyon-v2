@@ -111,22 +111,44 @@ export async function generatePairingUri(userId: number): Promise<WalletSession 
   try {
     const raw = await callBaw(['auth', 'signin'], userId, 15_000) as Record<string, unknown>;
 
+    // Log raw shape BEFORE any parsing so "unexpected shape" is always diagnosable
+    logger.info(
+      { userId, rawKeys: Object.keys(raw), rawSnippet: JSON.stringify(raw).slice(0, 500) },
+      'baw auth signin raw response',
+    );
+
     // Handle "already connected" case
     if (raw.status === 'ALREADY_CONNECTED') {
       logger.info({ userId }, 'baw: already connected');
       const existing = sessions.get(userId);
       if (existing?.walletAddress) return existing;
-      // Re-read address
       return await refreshSessionFromBaw(userId);
     }
 
-    const qrCodeId    = String(raw.qrCodeId   ?? '');
-    const urlForWeb   = String(raw.urlForWeb   ?? '');
-    const expireAt    = Number(raw.expireAt    ?? Date.now() + 300_000);
-    const pairingCode = raw.pairingCode != null ? String(raw.pairingCode) : undefined;
+    // Binance API sometimes wraps payload under .data or .result
+    const payload: Record<string, unknown> =
+      raw.data   != null && typeof raw.data   === 'object' ? raw.data   as Record<string, unknown> :
+      raw.result != null && typeof raw.result === 'object' ? raw.result as Record<string, unknown> :
+      raw;
+
+    // Also bubble up nested "already connected"
+    if (payload.status === 'ALREADY_CONNECTED') {
+      logger.info({ userId }, 'baw: already connected (nested payload)');
+      const existing = sessions.get(userId);
+      if (existing?.walletAddress) return existing;
+      return await refreshSessionFromBaw(userId);
+    }
+
+    const qrCodeId    = String(payload.qrCodeId    ?? payload.qrCode    ?? payload.id    ?? '');
+    const urlForWeb   = String(payload.urlForWeb   ?? payload.qrCodeUrl ?? payload.url   ?? payload.link ?? '');
+    const expireAt    = Number(payload.expireAt    ?? payload.expiry    ?? payload.expiresAt ?? Date.now() + 300_000);
+    const pairingCode = payload.pairingCode != null ? String(payload.pairingCode) : undefined;
 
     if (!qrCodeId || !urlForWeb) {
-      logger.error({ raw, userId }, 'baw auth signin: unexpected shape');
+      logger.error(
+        { userId, payloadKeys: Object.keys(payload), rawKeys: Object.keys(raw), rawSnippet: JSON.stringify(raw).slice(0, 500) },
+        'baw auth signin: unexpected shape — cannot find qrCodeId/urlForWeb',
+      );
       return null;
     }
 
@@ -147,21 +169,31 @@ export async function generatePairingUri(userId: number): Promise<WalletSession 
   }
 }
 
+/** Unwraps Binance API envelope: { data: {...} } or { result: {...} } or root. */
+function unwrap(raw: Record<string, unknown>): Record<string, unknown> {
+  if (raw.data   != null && typeof raw.data   === 'object') return raw.data   as Record<string, unknown>;
+  if (raw.result != null && typeof raw.result === 'object') return raw.result as Record<string, unknown>;
+  return raw;
+}
+
 /** Re-reads wallet address + agent ID from baw and updates the session cache. */
 async function refreshSessionFromBaw(userId: number): Promise<WalletSession | null> {
   try {
     const [addrRaw, agentRaw] = await Promise.all([
-      callBaw(['wallet', 'address'], userId, 10_000) as Promise<Record<string, unknown>>,
+      callBaw(['wallet', 'address'], userId, 10_000)
+        .then(r => unwrap(r as Record<string, unknown>)) as Promise<Record<string, unknown>>,
       callBaw(['wallet', 'agent-id'], userId, 10_000)
+        .then(r => unwrap(r as Record<string, unknown>))
         .catch(() => ({ claimed: false })) as Promise<Record<string, unknown>>,
     ]);
 
     const walletAddress = extractBscAddress(addrRaw);
     if (!walletAddress) return null;
 
+    // agentId may be at root or nested after unwrap; also check .agentId vs .agent_id
     const agentIdName =
-      agentRaw.claimed === true && typeof agentRaw.agentId === 'string'
-        ? agentRaw.agentId
+      agentRaw.claimed === true && (typeof agentRaw.agentId === 'string' || typeof agentRaw.agent_id === 'string')
+        ? String(agentRaw.agentId ?? agentRaw.agent_id)
         : undefined;
 
     const session: WalletSession = {
@@ -281,11 +313,12 @@ export interface QuotaInfo {
 
 export async function getQuota(userId: number): Promise<QuotaInfo | null> {
   try {
-    const raw = await callBaw(['wallet', 'left-quota'], userId, 10_000) as Record<string, unknown>;
+    const r = await callBaw(['wallet', 'left-quota'], userId, 10_000) as Record<string, unknown>;
+    const p = unwrap(r);
     return {
-      quotaUsed:  Number(raw.quotaUsed  ?? 0),
-      quotaLeft:  Number(raw.quotaLeft  ?? 0),
-      dailyLimit: Number(raw.dailyLimit ?? 0),
+      quotaUsed:  Number(p.quotaUsed  ?? p.quota_used  ?? 0),
+      quotaLeft:  Number(p.quotaLeft  ?? p.quota_left  ?? 0),
+      dailyLimit: Number(p.dailyLimit ?? p.daily_limit ?? 0),
     };
   } catch { return null; }
 }
@@ -336,7 +369,8 @@ export async function executeContractCall(opts: {
       ...(gasLimit != null ? ['--gasLimit', String(gasLimit)] : []),
     ];
     const previewRaw = await callBaw(previewArgs, userId, 30_000) as Record<string, unknown>;
-    const requestId  = String(previewRaw.requestId ?? (previewRaw as Record<string,Record<string,unknown>>)?.data?.requestId ?? '');
+    const previewPayload = unwrap(previewRaw);
+    const requestId  = String(previewPayload.requestId ?? previewPayload.request_id ?? '');
     if (!requestId) throw new Error(`baw contract-call preview returned no requestId: ${JSON.stringify(previewRaw).slice(0, 200)}`);
 
     logger.info({ userId, requestId, to }, 'contract-call preview ok');
@@ -344,9 +378,9 @@ export async function executeContractCall(opts: {
     // Phase 2: execute
     const execRaw = await callBaw(['contract-call', 'execute', '--requestId', requestId], userId, 60_000) as Record<string, unknown>;
 
-    // txHash may be at root or inside .data
-    const data = (execRaw as Record<string, unknown>).data as Record<string, unknown> | undefined;
-    const txHash = String(execRaw.txHash ?? execRaw.transactionHash ?? data?.txHash ?? data?.transactionHash ?? '');
+    // txHash may be at root or inside .data / .result (Binance API envelope)
+    const execPayload = unwrap(execRaw);
+    const txHash = String(execPayload.txHash ?? execPayload.transactionHash ?? execPayload.tx_hash ?? '');
     if (!txHash || !/^0x[0-9a-fA-F]{64}$/.test(txHash)) {
       throw new Error(`baw contract-call execute returned invalid txHash: ${JSON.stringify(execRaw).slice(0, 200)}`);
     }
@@ -361,18 +395,20 @@ export async function executeContractCall(opts: {
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
 function extractBscAddress(raw: Record<string, unknown>): string | null {
-  if (Array.isArray(raw.addresses)) {
-    for (const e of raw.addresses as Array<{ chain?: string; address?: string }>) {
+  // Unwrap envelope first
+  const p = unwrap(raw);
+  if (Array.isArray(p.addresses)) {
+    for (const e of p.addresses as Array<{ chain?: string; address?: string }>) {
       const chain = (e.chain ?? '').replace(/\s/g, '').toUpperCase();
       if (['BSC','BNB','BNBCHAIN','BNBSMARTCHAIN'].includes(chain) &&
           e.address && /^0x[0-9a-fA-F]{40}$/.test(e.address)) return e.address;
     }
-    for (const e of raw.addresses as Array<{ address?: string }>) {
+    for (const e of p.addresses as Array<{ address?: string }>) {
       if (e.address && /^0x[0-9a-fA-F]{40}$/.test(e.address)) return e.address;
     }
   }
   for (const key of ['bsc','bnb','bnbChain','address']) {
-    const v = raw[key];
+    const v = p[key];
     if (typeof v === 'string' && /^0x[0-9a-fA-F]{40}$/.test(v)) return v;
   }
   logger.warn({ raw }, 'extractBscAddress: no BSC address found');

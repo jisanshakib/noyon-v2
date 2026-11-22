@@ -51,7 +51,18 @@ const healthServer = http.createServer((req, res) => {
 // ── Startup ───────────────────────────────────────────────────────────────────
 async function main(): Promise<void> {
   logger.info('Starting BNB Telegram Bot…');
-  await initDb();
+
+  // DB init is non-fatal — bot starts in degraded mode if Supabase is unreachable
+  try {
+    await initDb();
+  } catch (err) {
+    const e = err as Error;
+    logger.error(
+      { msg: e.message, stack: e.stack, cause: (e as NodeJS.ErrnoException).code },
+      'DB init failed — starting in degraded mode (no DB persistence until reconnected)',
+    );
+  }
+
   healthServer.listen(PORT, () => logger.info({ port: PORT }, 'Health server listening'));
   await bot.launch({ allowedUpdates: ['message', 'callback_query'] });
   logger.info('Bot running (long polling)');
@@ -65,4 +76,10 @@ function shutdown(signal: string): void {
 
 process.once('SIGINT',  () => shutdown('SIGINT'));
 process.once('SIGTERM', () => shutdown('SIGTERM'));
-main().catch(err => { logger.error({ err }, 'Fatal startup error'); process.exit(1); });
+main().catch(err => {
+  const e = err as Error;
+  console.error('FATAL STARTUP ERROR:', e?.message ?? e);
+  console.error('Stack:', e?.stack);
+  console.error('Cause:', (e as NodeJS.ErrnoException)?.code ?? (e as Error & { cause?: unknown })?.cause);
+  process.exit(1);
+});
