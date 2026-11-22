@@ -457,6 +457,129 @@ export async function getQuota(userId: number): Promise<QuotaInfo | null> {
   } catch { return null; }
 }
 
+// ─── wallet settings & Developer Mode check (authoritative via baw) ──────────
+
+export interface BawWalletSettings {
+  devModeEnabled: boolean | null;
+  devModeExpiresAt: string | null;
+  devModeExpired: boolean;
+  devModeDailyLimit: number;
+  devModeQuotaUsed: number | null;
+  devModeBalanceExceeded: boolean;
+  dailyLimit: number;
+  quotaUsed: number;
+  quotaLeft: number;
+  rawDevMode: unknown;
+}
+
+function parseBoolish(v: unknown): boolean | null {
+  if (typeof v === 'boolean') return v;
+  if (typeof v === 'number') return v !== 0;
+  if (typeof v === 'string') {
+    const s = v.trim().toLowerCase();
+    if (s === 'true' || s === '1' || s === 'enabled' || s === 'yes') return true;
+    if (s === 'false' || s === '0' || s === 'disabled' || s === 'no') return false;
+  }
+  return null;
+}
+
+function toFiniteNumber(v: unknown, fallback = 0): number {
+  const n = typeof v === 'number' ? v : Number(v);
+  return Number.isFinite(n) ? n : fallback;
+}
+
+/**
+ * Queries `baw wallet settings --json` for the user's isolated session.
+ * This is the authoritative source for Binance Agentic Wallet Developer Mode
+ * (`devMode.enabled`, `devMode.expiresAt`, `devMode.dailyLimit`, `devMode.balanceExceeded`)
+ * and daily trading / developer-mode quotas.
+ *
+ * Propagates `isSessionExpired` errors so callers can prompt re-pairing.
+ */
+export async function getBawWalletSettings(
+  userId: number,
+): Promise<{ ok: true; settings: BawWalletSettings } | { ok: false; error: string }> {
+  try {
+    const raw = await callBaw(['wallet', 'settings'], userId, 15_000) as Record<string, unknown>;
+    const p   = unwrap(raw);
+
+    const devModeObj =
+      p.devMode != null && typeof p.devMode === 'object'
+        ? (p.devMode as Record<string, unknown>)
+        : null;
+
+    // `baw wallet settings --json` returns `devMode: { enabled, expiresAt, dailyLimit, balanceExceeded }`
+    // or `devMode: null` if Developer Mode is not configured/enabled.
+    let devModeEnabled: boolean | null = null;
+    if (devModeObj) {
+      devModeEnabled = parseBoolish(devModeObj.enabled ?? devModeObj.isEnabled ?? devModeObj.status);
+    } else if ('devMode' in p && p.devMode === null) {
+      devModeEnabled = false;
+    } else {
+      devModeEnabled = parseBoolish(p.developerModeEnabled ?? p.devModeEnabled);
+    }
+
+    const rawExpires = devModeObj?.expiresAt ?? null;
+    const devModeExpiresAt = rawExpires != null ? String(rawExpires) : null;
+    let devModeExpired = false;
+    if (devModeExpiresAt) {
+      const ts = /^\d+$/.test(devModeExpiresAt)
+        ? (devModeExpiresAt.length <= 10 ? Number(devModeExpiresAt) * 1000 : Number(devModeExpiresAt))
+        : Date.parse(devModeExpiresAt);
+      if (Number.isFinite(ts) && ts > 0 && ts < Date.now()) {
+        devModeExpired = true;
+      }
+    }
+
+    const devModeDailyLimit = toFiniteNumber(devModeObj?.dailyLimit, 0);
+    const devModeQuotaUsed =
+      p.developerModeQuotaUsed == null ? null : toFiniteNumber(p.developerModeQuotaUsed, 0);
+    const devModeBalanceExceeded = parseBoolish(devModeObj?.balanceExceeded) === true;
+
+    const dailyLimit = toFiniteNumber(p.dailyLimit, 0);
+    const quotaUsed  = toFiniteNumber(p.quotaUsed, 0);
+    const quotaLeft  =
+      p.quotaLeft != null ? toFiniteNumber(p.quotaLeft, Math.max(0, dailyLimit - quotaUsed)) : Math.max(0, dailyLimit - quotaUsed);
+
+    const settings: BawWalletSettings = {
+      devModeEnabled,
+      devModeExpiresAt,
+      devModeExpired,
+      devModeDailyLimit,
+      devModeQuotaUsed,
+      devModeBalanceExceeded,
+      dailyLimit,
+      quotaUsed,
+      quotaLeft,
+      rawDevMode: p.devMode ?? null,
+    };
+
+    logger.info(
+      {
+        userId,
+        rawKeys: Object.keys(p),
+        devMode: settings.rawDevMode,
+        evaluatedDevModeEnabled: settings.devModeEnabled,
+        devModeExpired: settings.devModeExpired,
+        devModeDailyLimit: settings.devModeDailyLimit,
+        devModeQuotaUsed: settings.devModeQuotaUsed,
+        devModeBalanceExceeded: settings.devModeBalanceExceeded,
+        quotaUsed: settings.quotaUsed,
+        quotaLeft: settings.quotaLeft,
+        dailyLimit: settings.dailyLimit,
+      },
+      'baw wallet settings check',
+    );
+
+    return { ok: true, settings };
+  } catch (err) {
+    const e = err as Error & { isSessionExpired?: boolean };
+    if (e.isSessionExpired) throw e;
+    logger.warn({ userId, err: e.message }, 'getBawWalletSettings failed');
+    return { ok: false, error: e.message };
+  }
+}
+
 // ─── Contract call (signing layer) ───────────────────────────────────────────
 
 export interface ContractCallResult {

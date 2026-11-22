@@ -87,14 +87,36 @@ export async function readBnbBalance(address: string): Promise<bigint> {
   return await provider.getBalance(address);
 }
 
-export async function readDeveloperMode(address: string): Promise<boolean> {
-  try { return Boolean(await mintContract().developerModeEnabled(address)); }
-  catch { return false; }
+export type OnChainReadResult<T> =
+  | { available: true; value: T }
+  | { available: false; error: string };
+
+export async function readDeveloperMode(address: string): Promise<OnChainReadResult<boolean>> {
+  try {
+    const raw = await mintContract().developerModeEnabled(address);
+    return { available: true, value: Boolean(raw) };
+  } catch (err) {
+    const msg = (err as Error)?.message ?? String(err);
+    logger.debug(
+      { walletAddress: address, contract: ADDR.MINT_CONTRACT, fn: 'developerModeEnabled(address)', err: msg },
+      'readDeveloperMode on-chain call unavailable (Developer Mode is managed in Binance Agentic Wallet settings)',
+    );
+    return { available: false, error: msg };
+  }
 }
 
-export async function readMintQuota(address: string): Promise<bigint> {
-  try { return BigInt(await mintContract().mintQuotaRemaining(address)); }
-  catch { return 0n; }
+export async function readMintQuota(address: string): Promise<OnChainReadResult<bigint>> {
+  try {
+    const raw = await mintContract().mintQuotaRemaining(address);
+    return { available: true, value: BigInt(raw) };
+  } catch (err) {
+    const msg = (err as Error)?.message ?? String(err);
+    logger.debug(
+      { walletAddress: address, contract: ADDR.MINT_CONTRACT, fn: 'mintQuotaRemaining(address)', err: msg },
+      'readMintQuota on-chain call unavailable (quota is checked via Binance Agentic Wallet settings)',
+    );
+    return { available: false, error: msg };
+  }
 }
 
 export async function readSpaceIdName(address: string): Promise<string> {
@@ -143,10 +165,25 @@ export async function simulateSellOutput(aiAmount: bigint): Promise<bigint> {
 
 // ─── Preflight checks ─────────────────────────────────────────────────────────
 
+export interface PreflightBawSettings {
+  devModeEnabled: boolean | null;
+  devModeExpiresAt: string | null;
+  devModeExpired: boolean;
+  devModeDailyLimit: number;
+  devModeQuotaUsed: number | null;
+  devModeBalanceExceeded: boolean;
+  dailyLimit: number;
+  quotaUsed: number;
+  quotaLeft: number;
+  rawDevMode?: unknown;
+}
+
 export interface PreflightContext {
   sessionAgentId?: string | null;
   dbAgentId?: string | null;
   bawAgentId?: string | null;
+  bawSettings?: PreflightBawSettings | null;
+  bawSettingsError?: string | null;
 }
 
 export interface PreflightResult {
@@ -164,7 +201,7 @@ export async function runPreflightChecks(
   mintCostWei: bigint,
   ctx?: PreflightContext,
 ): Promise<PreflightResult> {
-  const [bnbBal, onChainSpaceId, devMode, quota] = await Promise.all([
+  const [bnbBal, onChainSpaceId, onChainDevMode, onChainQuota] = await Promise.all([
     readBnbBalance(walletAddress),
     readSpaceIdName(walletAddress),
     readDeveloperMode(walletAddress),
@@ -198,6 +235,22 @@ export async function runPreflightChecks(
     agentIdSource   = 'db';
   }
 
+  // Evaluate Developer Mode:
+  // Developer Mode is an off-chain Binance Agentic Wallet setting (`baw wallet settings --json`),
+  // NOT a Solidity method on the BSC mint contract. Check `bawSettings` first; fall back to
+  // on-chain `developerModeEnabled(address)` only if that view call actually exists on-chain.
+  const bawSettings = ctx?.bawSettings ?? null;
+  let devModeSource: 'baw_settings' | 'onchain' | 'unavailable' = 'unavailable';
+  let devModeEnabled: boolean | null = null;
+
+  if (bawSettings && bawSettings.devModeEnabled !== null) {
+    devModeSource  = 'baw_settings';
+    devModeEnabled = bawSettings.devModeEnabled && !bawSettings.devModeExpired;
+  } else if (onChainDevMode.available) {
+    devModeSource  = 'onchain';
+    devModeEnabled = onChainDevMode.value;
+  }
+
   logger.info(
     {
       walletAddress,
@@ -208,10 +261,26 @@ export async function runPreflightChecks(
       resolvedAgentId: resolvedAgentId || null,
       agentIdSource,
       bnbBalance: ethers.formatEther(bnbBal),
-      devMode,
-      quota: quota.toString(),
+      devModeCheck: {
+        source: devModeSource,
+        evaluatedEnabled: devModeEnabled,
+        bawRawDevMode: bawSettings?.rawDevMode ?? null,
+        bawDevModeExpired: bawSettings?.devModeExpired ?? false,
+        bawDevModeBalanceExceeded: bawSettings?.devModeBalanceExceeded ?? false,
+        bawSettingsError: ctx?.bawSettingsError ?? null,
+        onChainAvailable: onChainDevMode.available,
+        onChainValue: onChainDevMode.available ? onChainDevMode.value : null,
+      },
+      quotaCheck: {
+        bawDevModeDailyLimit: bawSettings?.devModeDailyLimit ?? null,
+        bawDevModeQuotaUsed: bawSettings?.devModeQuotaUsed ?? null,
+        bawDailyLimit: bawSettings?.dailyLimit ?? null,
+        bawQuotaLeft: bawSettings?.quotaLeft ?? null,
+        onChainAvailable: onChainQuota.available,
+        onChainValue: onChainQuota.available ? onChainQuota.value.toString() : null,
+      },
     },
-    'Preflight Agent ID & chain state check',
+    'Preflight Agent ID, Developer Mode & chain state check',
   );
 
   const boundCandidate = bawName || sessionName || dbName;
@@ -242,20 +311,88 @@ export async function runPreflightChecks(
       reason: 'No SPACE ID AI name (*.ai) on this wallet. Register one in the SPACE ID AI dashboard first.',
     };
   }
-  if (!devMode) {
+
+  if (devModeSource === 'baw_settings' && bawSettings) {
+    if (bawSettings.devModeEnabled === false) {
+      return {
+        ok: false,
+        resolvedAgentId,
+        reason:
+          'Developer mode is not enabled in your Binance Agentic Wallet. ' +
+          'Enable it in Binance App → Agentic Wallet → Settings → Developer Mode.',
+      };
+    }
+    if (bawSettings.devModeExpired) {
+      return {
+        ok: false,
+        resolvedAgentId,
+        reason:
+          `Developer mode expired (${bawSettings.devModeExpiresAt ?? 'past expiry'}). ` +
+          'Re-enable it in Binance App → Agentic Wallet → Settings → Developer Mode.',
+      };
+    }
+    if (bawSettings.devModeBalanceExceeded) {
+      return {
+        ok: false,
+        resolvedAgentId,
+        reason:
+          'Developer mode balance limit is exceeded in your Binance Agentic Wallet settings. ' +
+          'Review your Developer Mode settings in the Binance App.',
+      };
+    }
+  } else if (devModeSource === 'onchain') {
+    if (!devModeEnabled) {
+      return {
+        ok: false,
+        resolvedAgentId,
+        reason: 'Developer mode is not enabled. Enable it in Binance App → Agentic Wallet → Settings → Developer Mode.',
+      };
+    }
+  } else {
+    // Neither baw settings nor on-chain read could confirm Developer Mode state.
     return {
       ok: false,
       resolvedAgentId,
-      reason: 'Developer mode is not enabled. Enable it in the SPACE ID AI dashboard.',
+      reason:
+        `Could not verify Developer Mode status from Binance Agentic Wallet` +
+        (ctx?.bawSettingsError ? ` (${ctx.bawSettingsError.slice(0, 120)})` : '') +
+        '. Ensure Developer Mode is enabled in Binance App → Agentic Wallet → Settings → Developer Mode and try again.',
     };
   }
-  if (quota === 0n) {
+
+  // Quota check:
+  // 1. Binance Agentic Wallet Developer Mode daily USD quota
+  if (
+    bawSettings &&
+    bawSettings.devModeDailyLimit > 0 &&
+    bawSettings.devModeQuotaUsed != null &&
+    bawSettings.devModeQuotaUsed >= bawSettings.devModeDailyLimit
+  ) {
+    return {
+      ok: false,
+      resolvedAgentId,
+      reason:
+        `Developer Mode daily quota exhausted ($${bawSettings.devModeQuotaUsed.toFixed(2)} / $${bawSettings.devModeDailyLimit.toFixed(2)}). ` +
+        'Increase your Developer Mode daily limit in the Binance App or wait for daily reset.',
+    };
+  }
+  // 2. General daily trading limit from baw settings
+  if (bawSettings && bawSettings.dailyLimit > 0 && bawSettings.quotaLeft <= 0) {
+    return {
+      ok: false,
+      resolvedAgentId,
+      reason: 'Daily trading quota exhausted in Binance Agentic Wallet. Wait for daily quota reset.',
+    };
+  }
+  // 3. On-chain mintQuotaRemaining (only enforced when the contract actually exposes this view method)
+  if (onChainQuota.available && onChainQuota.value === 0n) {
     return {
       ok: false,
       resolvedAgentId,
       reason: 'Mint quota exhausted. Wait for daily quota reset.',
     };
   }
+
   return { ok: true, resolvedAgentId };
 }
 

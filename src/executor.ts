@@ -27,7 +27,7 @@ import {
   isMintRaceError, ADDR,
 } from './bsc.js';
 import {
-  isSessionConnectedDb, executeContractCall, getSession, fetchBawAgentId, syncAgentId,
+  isSessionConnectedDb, executeContractCall, getSession, fetchBawAgentId, getBawWalletSettings, syncAgentId,
 } from './wallet.js';
 import { generateExecutionSummary } from './gemini.js';
 import { insertExecution, pool } from './db.js';
@@ -119,9 +119,12 @@ export async function runFullExecution(
       walletAddress;
     resolvedAgentId = agentId;
 
-    // ── 2. Read live mint cost ────────────────────────────────────────────────
-    await onStatus('📡 Reading live mint cost from chain…');
-    const mintCostWei = await readCostOf(10n);
+    // ── 2. Read live mint cost & Binance Agentic Wallet settings (Developer Mode + quota) ──
+    await onStatus('📡 Reading live mint cost & wallet settings…');
+    const [mintCostWei, bawSettingsRes] = await Promise.all([
+      readCostOf(10n),
+      getBawWalletSettings(userId),
+    ]);
 
     // ── 3. Preflight stop-condition checks ───────────────────────────────────
     await onStatus('🛡 Running preflight checks…');
@@ -129,6 +132,8 @@ export async function runFullExecution(
       sessionAgentId: sessionAgentId || null,
       dbAgentId: persistedAgentId || null,
       bawAgentId: bawAgentId || null,
+      bawSettings: bawSettingsRes.ok ? bawSettingsRes.settings : null,
+      bawSettingsError: bawSettingsRes.ok ? null : bawSettingsRes.error,
     });
     if (preflight.resolvedAgentId) {
       agentId = preflight.resolvedAgentId;
