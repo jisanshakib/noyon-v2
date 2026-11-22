@@ -8,7 +8,7 @@
 //
 // Contracts:
 //   MINT_CONTRACT  = 0xa4bFa31f615F8e2a13dce3d93C0996CC5a56763D
-//   AI_TOKEN       = 0x2a60AaB19b182B5C4b47fffC066ADA06Ab27924F
+//   AI_TOKEN       = 0x2a60AaB19b182B5C4b47fffC066ADA06Ab27924f
 //   WBNB           = 0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c
 //   PANCAKE_ROUTER = 0x10ED43C718714eb63d5aA57B78B54704E256024E
 //   REFERRER       = 0x85377229b28515432cCF1e1c4999BB71C9AdBE11 (noyonislam.ai — NEVER change)
@@ -25,14 +25,36 @@ export const provider = new ethers.JsonRpcProvider(config.BSC_RPC_URL, {
   name: 'bnb',
 });
 
-// ─── Addresses ───────────────────────────────────────────────────────────────
+// ─── Address Normalization (EIP-55 safe for ethers v6) ───────────────────────
+
+/**
+ * Validates a 20-byte EVM hex address and returns its canonical EIP-55 checksummed
+ * representation by lowercasing first so mis-cased mixed-case literals never throw
+ * ethers v6 `bad address checksum` (INVALID_ARGUMENT).
+ */
+export function normalizeAddress(raw: string, label = 'address'): string {
+  const trimmed = raw.trim();
+  if (!/^0x[0-9a-fA-F]{40}$/.test(trimmed)) {
+    throw new Error(`Invalid EVM ${label}: "${raw}"`);
+  }
+  const normalized = ethers.getAddress(trimmed.toLowerCase());
+  if (trimmed !== normalized) {
+    logger.info(
+      { label, original: trimmed, normalized },
+      'Normalized EVM address to canonical EIP-55 checksum',
+    );
+  }
+  return normalized;
+}
+
+// ─── Addresses (all EIP-55 normalized at load time) ──────────────────────────
 
 export const ADDR = {
-  MINT_CONTRACT:  '0xa4bFa31f615F8e2a13dce3d93C0996CC5a56763D',
-  AI_TOKEN:       '0x2a60AaB19b182B5C4b47fffC066ADA06Ab27924F',
-  WBNB:           '0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c',
-  PANCAKE_ROUTER: '0x10ED43C718714eb63d5aA57B78B54704E256024E',
-  REFERRER:       '0x85377229b28515432cCF1e1c4999BB71C9AdBE11', // noyonislam.ai — NEVER change
+  MINT_CONTRACT:  normalizeAddress('0xa4bFa31f615F8e2a13dce3d93C0996CC5a56763D', 'ADDR.MINT_CONTRACT'),
+  AI_TOKEN:       normalizeAddress('0x2a60AaB19b182B5C4b47fffC066ADA06Ab27924f', 'ADDR.AI_TOKEN'),
+  WBNB:           normalizeAddress('0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c', 'ADDR.WBNB'),
+  PANCAKE_ROUTER: normalizeAddress('0x10ED43C718714eb63d5aA57B78B54704E256024E', 'ADDR.PANCAKE_ROUTER'),
+  REFERRER:       normalizeAddress('0x85377229b28515432cCF1e1c4999BB71C9AdBE11', 'ADDR.REFERRER'), // noyonislam.ai — NEVER change
 } as const;
 
 export const REFERRER_NAME = 'noyonislam.ai' as const;
@@ -80,11 +102,42 @@ export async function readTotalMinted(): Promise<bigint> {
 }
 
 export async function readAiBalance(address: string): Promise<bigint> {
-  return BigInt(await aiTokenContract().balanceOf(address));
+  const owner = normalizeAddress(address, 'readAiBalance.owner');
+  return BigInt(await aiTokenContract().balanceOf(owner));
+}
+
+export async function readAiAllowance(ownerAddress: string, spenderAddress = ADDR.PANCAKE_ROUTER): Promise<bigint> {
+  const owner   = normalizeAddress(ownerAddress, 'readAiAllowance.owner');
+  const spender = normalizeAddress(spenderAddress, 'readAiAllowance.spender');
+  try {
+    return BigInt(await aiTokenContract().allowance(owner, spender));
+  } catch (err) {
+    logger.warn({ owner, spender, err: (err as Error)?.message }, 'readAiAllowance failed — returning 0');
+    return 0n;
+  }
 }
 
 export async function readBnbBalance(address: string): Promise<bigint> {
-  return await provider.getBalance(address);
+  const wallet = normalizeAddress(address, 'readBnbBalance.address');
+  return await provider.getBalance(wallet);
+}
+
+export async function readTxValueWei(txHash: string): Promise<bigint | null> {
+  try {
+    const tx = await provider.getTransaction(txHash);
+    return tx?.value != null ? BigInt(tx.value) : null;
+  } catch (err) {
+    logger.warn({ txHash, err: (err as Error)?.message }, 'readTxValueWei failed');
+    return null;
+  }
+}
+
+export async function waitForTxConfirmation(txHash: string, timeoutMs = 30_000): Promise<void> {
+  try {
+    await provider.waitForTransaction(txHash, 1, timeoutMs);
+  } catch (err) {
+    logger.warn({ txHash, err: (err as Error)?.message }, 'waitForTxConfirmation timed out or failed — continuing');
+  }
 }
 
 export type OnChainReadResult<T> =
@@ -92,13 +145,14 @@ export type OnChainReadResult<T> =
   | { available: false; error: string };
 
 export async function readDeveloperMode(address: string): Promise<OnChainReadResult<boolean>> {
+  const wallet = normalizeAddress(address, 'readDeveloperMode.address');
   try {
-    const raw = await mintContract().developerModeEnabled(address);
+    const raw = await mintContract().developerModeEnabled(wallet);
     return { available: true, value: Boolean(raw) };
   } catch (err) {
     const msg = (err as Error)?.message ?? String(err);
     logger.debug(
-      { walletAddress: address, contract: ADDR.MINT_CONTRACT, fn: 'developerModeEnabled(address)', err: msg },
+      { walletAddress: wallet, contract: ADDR.MINT_CONTRACT, fn: 'developerModeEnabled(address)', err: msg },
       'readDeveloperMode on-chain call unavailable (Developer Mode is managed in Binance Agentic Wallet settings)',
     );
     return { available: false, error: msg };
@@ -106,13 +160,14 @@ export async function readDeveloperMode(address: string): Promise<OnChainReadRes
 }
 
 export async function readMintQuota(address: string): Promise<OnChainReadResult<bigint>> {
+  const wallet = normalizeAddress(address, 'readMintQuota.address');
   try {
-    const raw = await mintContract().mintQuotaRemaining(address);
+    const raw = await mintContract().mintQuotaRemaining(wallet);
     return { available: true, value: BigInt(raw) };
   } catch (err) {
     const msg = (err as Error)?.message ?? String(err);
     logger.debug(
-      { walletAddress: address, contract: ADDR.MINT_CONTRACT, fn: 'mintQuotaRemaining(address)', err: msg },
+      { walletAddress: wallet, contract: ADDR.MINT_CONTRACT, fn: 'mintQuotaRemaining(address)', err: msg },
       'readMintQuota on-chain call unavailable (quota is checked via Binance Agentic Wallet settings)',
     );
     return { available: false, error: msg };
@@ -120,12 +175,13 @@ export async function readMintQuota(address: string): Promise<OnChainReadResult<
 }
 
 export async function readSpaceIdName(address: string): Promise<string> {
+  const wallet = normalizeAddress(address, 'readSpaceIdName.address');
   try {
-    const name = String(await mintContract().spaceIdAiName(address) ?? '').trim();
+    const name = String(await mintContract().spaceIdAiName(wallet) ?? '').trim();
     return name;
   } catch (err) {
     logger.warn(
-      { walletAddress: address, err: (err as Error)?.message ?? String(err) },
+      { walletAddress: wallet, err: (err as Error)?.message ?? String(err) },
       'readSpaceIdName on-chain lookup returned error (will allow session/DB/baw fallback)',
     );
     return '';
@@ -184,6 +240,8 @@ export interface PreflightContext {
   bawAgentId?: string | null;
   bawSettings?: PreflightBawSettings | null;
   bawSettingsError?: string | null;
+  /** True when resuming an already-minted AI token balance (only gas buffer needed, not another mintCost). */
+  skipMintCostBalanceCheck?: boolean;
 }
 
 export interface PreflightResult {
@@ -193,14 +251,16 @@ export interface PreflightResult {
 }
 
 /** Minimum BNB recommended (~0.08 BNB covers mint cost + gas buffer) */
-export const GAS_BUFFER = ethers.parseEther('0.01');
-export const MIN_BNB    = ethers.parseEther('0.08');
+export const GAS_BUFFER        = ethers.parseEther('0.01');
+export const RESUME_GAS_BUFFER = ethers.parseEther('0.005');
+export const MIN_BNB           = ethers.parseEther('0.08');
 
 export async function runPreflightChecks(
-  walletAddress: string,
+  rawWalletAddress: string,
   mintCostWei: bigint,
   ctx?: PreflightContext,
 ): Promise<PreflightResult> {
+  const walletAddress = normalizeAddress(rawWalletAddress, 'preflight.walletAddress');
   const [bnbBal, onChainSpaceId, onChainDevMode, onChainQuota] = await Promise.all([
     readBnbBalance(walletAddress),
     readSpaceIdName(walletAddress),
@@ -295,14 +355,15 @@ export async function runPreflightChecks(
     );
   }
 
-  const needed = mintCostWei + GAS_BUFFER;
+  const needed = ctx?.skipMintCostBalanceCheck ? RESUME_GAS_BUFFER : mintCostWei + GAS_BUFFER;
   if (bnbBal < needed) {
     return {
       ok: false,
       resolvedAgentId: resolvedAgentId || undefined,
-      reason:
-        `Insufficient BNB. Need ≥ ${ethers.formatEther(needed)} BNB (have ${ethers.formatEther(bnbBal)} BNB). ` +
-        `Minimum recommended: ${ethers.formatEther(MIN_BNB)} BNB.`,
+      reason: ctx?.skipMintCostBalanceCheck
+        ? `Insufficient BNB for approve/sell gas. Need ≥ ${ethers.formatEther(needed)} BNB (have ${ethers.formatEther(bnbBal)} BNB).`
+        : `Insufficient BNB. Need ≥ ${ethers.formatEther(needed)} BNB (have ${ethers.formatEther(bnbBal)} BNB). ` +
+          `Minimum recommended: ${ethers.formatEther(MIN_BNB)} BNB.`,
     };
   }
   if (!resolvedAgentId) {
@@ -433,7 +494,8 @@ export async function buildMintCalldata(shares = 10n): Promise<{
  * No over-approval — amount is the exact tokensReceived from mint.
  */
 export function buildApproveCalldata(amount: bigint): string {
-  return erc20Iface.encodeFunctionData('approve', [ADDR.PANCAKE_ROUTER, amount]);
+  const spender = normalizeAddress(ADDR.PANCAKE_ROUTER, 'approve.spender');
+  return erc20Iface.encodeFunctionData('approve', [spender, amount]);
 }
 
 /**
@@ -441,10 +503,13 @@ export function buildApproveCalldata(amount: bigint): string {
  * amountOutMin = 0 — stop-loss check enforced upstream by executor.
  */
 export function buildSellCalldata(aiAmount: bigint, walletAddress: string): string {
-  const deadline = BigInt(Math.floor(Date.now() / 1000) + 600);
+  const recipient = normalizeAddress(walletAddress, 'sell.recipient');
+  const tokenIn   = normalizeAddress(ADDR.AI_TOKEN, 'sell.tokenIn');
+  const tokenOut  = normalizeAddress(ADDR.WBNB, 'sell.tokenOut');
+  const deadline  = BigInt(Math.floor(Date.now() / 1000) + 600);
   return routerIface.encodeFunctionData(
     'swapExactTokensForETHSupportingFeeOnTransferTokens',
-    [aiAmount, 0n, [ADDR.AI_TOKEN, ADDR.WBNB], walletAddress, deadline],
+    [aiAmount, 0n, [tokenIn, tokenOut], recipient, deadline],
   );
 }
 
@@ -486,7 +551,9 @@ export async function simulateContractCall(opts: {
   data: string;
   value?: bigint;
 }): Promise<RpcSimulationResult> {
-  const { step, from, to, data, value = 0n } = opts;
+  const { step, data, value = 0n } = opts;
+  const from = normalizeAddress(opts.from, `${step}.from`);
+  const to   = normalizeAddress(opts.to, `${step}.to`);
   const fnSelector = data.slice(0, 10);
 
   try {

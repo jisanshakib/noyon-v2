@@ -249,6 +249,35 @@ export async function getUserExecutions(
   return rows;
 }
 
+/**
+ * Returns the latest non-completed execution for a user where a mint TX was
+ * already broadcast (`tx_hashes->>'mint'` present) but `sell` never completed.
+ * Used to resume Approve → Sell instead of blindly re-minting.
+ */
+export async function getLatestUnfinishedMint(
+  userId: number,
+): Promise<DbExecution | null> {
+  try {
+    const { rows } = await pool.query<DbExecution>(
+      `SELECT *
+       FROM executions
+       WHERE telegram_user_id = $1
+         AND status <> 'COMPLETED'
+         AND tx_hashes IS NOT NULL
+         AND tx_hashes->>'mint' IS NOT NULL
+         AND tx_hashes->>'sell' IS NULL
+       ORDER BY created_at DESC
+       LIMIT 1`,
+      [userId],
+    );
+    dbReady = true;
+    return rows[0] ?? null;
+  } catch (err) {
+    logger.warn({ err, userId }, 'getLatestUnfinishedMint failed (continuing with on-chain check)');
+    return null;
+  }
+}
+
 // ─── Admin helpers (NEVER expose to non-admin handlers) ──────────────────────
 
 export interface AdminOverviewStats {

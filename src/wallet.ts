@@ -17,9 +17,22 @@
 import { spawn }    from 'child_process';
 import * as path    from 'path';
 import * as fs      from 'fs';
+import { ethers }   from 'ethers';
 import { config }   from './config.js';
 import { logger }   from './logger.js';
 import { pool }     from './db.js';
+
+function normalizeEvmAddress(raw: string, label = 'wallet.address'): string {
+  const trimmed = raw.trim();
+  if (!/^0x[0-9a-fA-F]{40}$/.test(trimmed)) {
+    throw new Error(`Invalid EVM ${label}: "${raw}"`);
+  }
+  const normalized = ethers.getAddress(trimmed.toLowerCase());
+  if (trimmed !== normalized) {
+    logger.info({ label, original: trimmed, normalized }, 'Normalized EVM address to EIP-55 checksum');
+  }
+  return normalized;
+}
 
 // ─── baw binary path (portable across npm layouts & OSes) ───────────────────
 function resolveBawBin(): string {
@@ -321,9 +334,10 @@ export async function markSessionConnected(
   walletAddress: string,
   agentIdName: string,
 ): Promise<void> {
-  const addr  = walletAddress.trim();
-  const agent = agentIdName.trim();
-  if (!addr) throw new Error('markSessionConnected: walletAddress is required');
+  const rawAddr = walletAddress.trim();
+  const agent   = agentIdName.trim();
+  if (!rawAddr) throw new Error('markSessionConnected: walletAddress is required');
+  const addr = normalizeEvmAddress(rawAddr, 'session.walletAddress');
 
   const existing = sessions.get(userId);
   sessions.set(userId, {
@@ -638,8 +652,6 @@ export async function executeContractCall(opts: {
 }): Promise<ContractCallResult> {
   const {
     userId,
-    walletAddress,
-    to,
     inputData,
     value = 0n,
     gasLimit,
@@ -647,6 +659,9 @@ export async function executeContractCall(opts: {
     rpcEstimatedGas,
     fallbackGasLimit = 900_000,
   } = opts;
+
+  const walletAddress = normalizeEvmAddress(opts.walletAddress, `${step}.from`);
+  const to            = normalizeEvmAddress(opts.to, `${step}.to`);
 
   const fnSelector    = inputData.slice(0, 10);
   const calldataBytes = Math.max(0, (inputData.length - 2) / 2);
@@ -816,15 +831,21 @@ function extractBscAddress(raw: Record<string, unknown>): string | null {
     for (const e of p.addresses as Array<{ chain?: string; address?: string }>) {
       const chain = (e.chain ?? '').replace(/\s/g, '').toUpperCase();
       if (['BSC','BNB','BNBCHAIN','BNBSMARTCHAIN'].includes(chain) &&
-          e.address && /^0x[0-9a-fA-F]{40}$/.test(e.address)) return e.address;
+          e.address && /^0x[0-9a-fA-F]{40}$/.test(e.address)) {
+        return normalizeEvmAddress(e.address, 'baw.bscAddress');
+      }
     }
     for (const e of p.addresses as Array<{ address?: string }>) {
-      if (e.address && /^0x[0-9a-fA-F]{40}$/.test(e.address)) return e.address;
+      if (e.address && /^0x[0-9a-fA-F]{40}$/.test(e.address)) {
+        return normalizeEvmAddress(e.address, 'baw.evmAddress');
+      }
     }
   }
   for (const key of ['bsc','bnb','bnbChain','address']) {
     const v = p[key];
-    if (typeof v === 'string' && /^0x[0-9a-fA-F]{40}$/.test(v)) return v;
+    if (typeof v === 'string' && /^0x[0-9a-fA-F]{40}$/.test(v)) {
+      return normalizeEvmAddress(v, `baw.${key}`);
+    }
   }
   logger.warn({ raw }, 'extractBscAddress: no BSC address found');
   return null;

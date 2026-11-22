@@ -21,7 +21,8 @@
 
 import { ethers } from 'ethers';
 import {
-  readCostOf, readBnbBalance, readAiBalance,
+  readCostOf, readBnbBalance, readAiBalance, readAiAllowance,
+  readTxValueWei, waitForTxConfirmation, normalizeAddress,
   runPreflightChecks, simulateSellOutput, simulateContractCall, isValidAiAgentId,
   buildMintCalldata, buildApproveCalldata, buildSellCalldata,
   isMintRaceError, isMintPriceMismatchError, GAS_BUFFER, ADDR,
@@ -30,7 +31,7 @@ import {
   isSessionConnectedDb, executeContractCall, getSession, fetchBawAgentId, getBawWalletSettings, syncAgentId,
 } from './wallet.js';
 import { generateExecutionSummary } from './gemini.js';
-import { insertExecution, pool } from './db.js';
+import { insertExecution, getLatestUnfinishedMint, pool } from './db.js';
 import { logger } from './logger.js';
 
 // ─── Constants ────────────────────────────────────────────────────────────────
@@ -91,16 +92,19 @@ export async function runFullExecution(
   const txHashes: Partial<Record<'mint' | 'approve' | 'sell', string>> = {};
   let resolvedWallet = '';
   let resolvedAgentId = '';
+  let trackedMintCostWei = 0n;
+  let trackedTokensWei   = 0n;
 
   try {
     // ── 1. Verify wallet session (Supabase-authoritative) ─────────────────────
     await onStatus('🔍 Verifying wallet connection…');
 
-    const { connected, address: walletAddress, dbAgentId } = await isSessionConnectedDb(userId);
-    if (!connected || !walletAddress) {
+    const { connected, address: rawWalletAddress, dbAgentId } = await isSessionConnectedDb(userId);
+    if (!connected || !rawWalletAddress) {
       return { ok: false, reason: 'Wallet not connected. Tap Connect Wallet and complete pairing first.' };
     }
 
+    const walletAddress = normalizeAddress(rawWalletAddress, 'executor.walletAddress');
     resolvedWallet = walletAddress;
     const session = getSession(userId);
     const sessionAgentId = session?.agentIdName?.trim() || '';
@@ -119,12 +123,30 @@ export async function runFullExecution(
       walletAddress;
     resolvedAgentId = agentId;
 
-    // ── 2. Read live mint cost & Binance Agentic Wallet settings (Developer Mode + quota) ──
-    await onStatus('📡 Reading live mint cost & wallet settings…');
-    const [mintCostWei, bawSettingsRes] = await Promise.all([
+    // ── 2. Read live mint cost, wallet settings, & check for existing unsold mint ──
+    await onStatus('📡 Reading live mint cost, AI balance & wallet settings…');
+    const [mintCostWei, bawSettingsRes, existingAiBalance, unfinishedMint] = await Promise.all([
       readCostOf(10n),
       getBawWalletSettings(userId),
+      readAiBalance(walletAddress),
+      getLatestUnfinishedMint(userId),
     ]);
+
+    const resumingExistingMint = existingAiBalance > 0n;
+    const priorMintTxHash = unfinishedMint?.tx_hashes?.mint ?? '';
+
+    if (resumingExistingMint) {
+      logger.info(
+        {
+          userId,
+          walletAddress,
+          existingAiBalance: ethers.formatUnits(existingAiBalance, 18),
+          priorMintTxHash: priorMintTxHash || null,
+          priorExecId: unfinishedMint?.id ?? null,
+        },
+        'Detected unsold AI tokens on-chain — will skip mint and resume Approve → Sell',
+      );
+    }
 
     // ── 3. Preflight stop-condition checks ───────────────────────────────────
     await onStatus('🛡 Running preflight checks…');
@@ -134,6 +156,7 @@ export async function runFullExecution(
       bawAgentId: bawAgentId || null,
       bawSettings: bawSettingsRes.ok ? bawSettingsRes.settings : null,
       bawSettingsError: bawSettingsRes.ok ? null : bawSettingsRes.error,
+      skipMintCostBalanceCheck: resumingExistingMint,
     });
     if (preflight.resolvedAgentId) {
       agentId = preflight.resolvedAgentId;
@@ -152,140 +175,194 @@ export async function runFullExecution(
       return { ok: false, reason: cancelReason };
     }
 
-    // ── 4. MINT (live price + dynamic gas + race/price retry) ────────────────
+    // ── 4. MINT (or RESUME from already-broadcast mint with unsold AI tokens) ──
     let mintTxHash = '';
     let tokensReceived = 0n;
     let actualMintCost = 0n;
-    let mintAttempt = 0;
 
-    while (mintAttempt < MAX_MINT_RETRIES) {
-      mintAttempt++;
+    if (resumingExistingMint) {
+      tokensReceived   = existingAiBalance;
+      trackedTokensWei = tokensReceived;
+      mintTxHash       = priorMintTxHash || 'resumed-onchain-balance';
+      if (priorMintTxHash) txHashes.mint = priorMintTxHash;
 
-      try {
-        // Always resolve the LIVE on-chain mint price & totalMinted right before each attempt
-        // (never reuse stale preflight or previous-attempt cost as share prices rise over time).
-        const [{ inputData, value, maxCost, expectedStart }, liveBnbBal] = await Promise.all([
-          buildMintCalldata(10n),
-          readBnbBalance(walletAddress),
-        ]);
-        actualMintCost = maxCost;
+      // Recover exact BNB spent on the prior mint TX (DB record → on-chain tx.value → live cost benchmark)
+      if (unfinishedMint?.mint_cost_bnb && parseFloat(unfinishedMint.mint_cost_bnb) > 0) {
+        try {
+          actualMintCost = ethers.parseEther(unfinishedMint.mint_cost_bnb);
+        } catch { /* fallback below */ }
+      }
+      if (actualMintCost === 0n && priorMintTxHash) {
+        const onChainVal = await readTxValueWei(priorMintTxHash);
+        if (onChainVal != null && onChainVal > 0n) actualMintCost = onChainVal;
+      }
+      if (actualMintCost === 0n) {
+        actualMintCost = mintCostWei;
+      }
+      trackedMintCostWei = actualMintCost;
 
-        const liveCostBnb = ethers.formatEther(maxCost);
-        const neededBnb   = maxCost + GAS_BUFFER;
-
-        await onStatus(
-          `🔄 Minting (attempt ${mintAttempt}/${MAX_MINT_RETRIES})…\n` +
-          `Live mint cost: ${liveCostBnb} BNB`,
-        );
-
-        logger.info(
-          {
-            userId,
-            attempt: mintAttempt,
-            to: ADDR.MINT_CONTRACT,
-            shares: '10',
-            referrer: ADDR.REFERRER,
-            preflightCostBnb: ethers.formatEther(mintCostWei),
-            liveMintCostBnb: liveCostBnb,
-            priceMovedSincePreflight: maxCost !== mintCostWei,
-            liveBnbBalance: ethers.formatEther(liveBnbBal),
-            expectedStart: expectedStart.toString(),
-          },
-          'Prepared live mint calldata',
-        );
-
-        // Re-check balance against the fresh live mint cost right before executing
-        if (liveBnbBal < neededBnb) {
-          const balReason =
-            `Insufficient BNB for live mint price. Need ≥ ${ethers.formatEther(neededBnb)} BNB ` +
-            `(live mint cost ${liveCostBnb} BNB + gas buffer), have ${ethers.formatEther(liveBnbBal)} BNB.`;
-          await logExecution(userId, walletAddress, 'STOPPED', 0n, 0n, 0n, txHashes, agentId, balReason);
-          return { ok: false, reason: `⛔ ${balReason}`, partialTxHashes: txHashes };
-        }
-
-        // Read-only BSC RPC simulation: estimates dynamic gas and catches contract reverts
-        // (including 0x5fb01790 expectedStart race or live price increase) before broadcast.
-        const mintSim = await simulateContractCall({
-          step:  'mint',
-          from:  walletAddress,
-          to:    ADDR.MINT_CONTRACT,
-          data:  inputData,
-          value,
-        });
-
-        if (!mintSim.ok && mintSim.isRevert) {
-          const simErr = { data: mintSim.revertData, message: mintSim.revertReason ?? mintSim.error };
-          if (isMintRaceError(simErr) || isMintPriceMismatchError(simErr)) {
-            throw Object.assign(
-              new Error(`Mint state changed during RPC simulation (${mintSim.revertReason ?? '0x5fb01790'})`),
-              { data: mintSim.revertData },
-            );
-          }
-          const revertMsg =
-            `Mint contract simulation reverted before broadcast` +
-            (mintSim.revertReason ? `: ${mintSim.revertReason}` : '') +
-            (mintSim.revertData ? ` (data: ${mintSim.revertData.slice(0, 18)})` : '') +
-            `. Check wallet eligibility, mint quota, or contract parameters.`;
-          await logExecution(userId, walletAddress, 'FAILED', 0n, 0n, 0n, txHashes, agentId, revertMsg);
-          return { ok: false, reason: `⛔ ${revertMsg}`, partialTxHashes: txHashes };
-        }
-
-        // Dynamic gasLimit = estimateGas * 1.4 (or 900k fallback ceiling if RPC estimate unavailable),
-        // with automatic single retry at a higher buffer if baw preview returns 351805.
-        const result = await executeContractCall({
+      await onStatus(
+        `♻️ Found existing unsold AI tokens (${ethers.formatUnits(tokensReceived, 18)} AI)` +
+        (priorMintTxHash ? ` from Mint TX ${priorMintTxHash.slice(0, 12)}…` : '') +
+        `.\nSkipping re-mint and resuming Approve → Sell…`,
+      );
+      logger.info(
+        {
           userId,
-          step:             'mint',
-          walletAddress,
-          to:               ADDR.MINT_CONTRACT,
-          inputData,
-          value,
-          rpcEstimatedGas:  mintSim.estimatedGas,
-          fallbackGasLimit: 900_000,
-        });
+          step: 'resume_from_mint',
+          mintTxHash,
+          recoveredMintCostBnb: ethers.formatEther(actualMintCost),
+          tokensReceived: ethers.formatUnits(tokensReceived, 18),
+        },
+        'Resuming cycle after already-broadcast mint',
+      );
+    } else {
+      let mintAttempt = 0;
 
-        mintTxHash = result.txHash;
-        txHashes.mint = mintTxHash;
+      while (mintAttempt < MAX_MINT_RETRIES) {
+        mintAttempt++;
 
-        // Read actual tokens received after mint lands
-        await onStatus(`⏳ Mint submitted (${mintTxHash.slice(0, 10)}…). Waiting for confirmation…`);
-        // baw execute blocks until confirmed; now read balance
-        tokensReceived = await readAiBalance(walletAddress);
+        try {
+          // Always resolve the LIVE on-chain mint price & totalMinted right before each attempt
+          // (never reuse stale preflight or previous-attempt cost as share prices rise over time).
+          const [{ inputData, value, maxCost, expectedStart }, liveBnbBal] = await Promise.all([
+            buildMintCalldata(10n),
+            readBnbBalance(walletAddress),
+          ]);
+          actualMintCost     = maxCost;
+          trackedMintCostWei = maxCost;
 
-        logger.info(
-          {
-            userId,
-            mintTxHash,
-            liveMintCostBnb: liveCostBnb,
-            appliedGasLimit: result.appliedGasLimit,
-            tokensReceived: tokensReceived.toString(),
-          },
-          'Mint confirmed',
-        );
-        break; // success
+          const liveCostBnb = ethers.formatEther(maxCost);
+          const neededBnb   = maxCost + GAS_BUFFER;
 
-      } catch (err) {
-        const e = err as Error & { isSessionExpired?: boolean };
-        if (e.isSessionExpired) {
-          const expReason = 'Binance Wallet session expired during mint. Please reconnect.';
-          await logExecution(userId, walletAddress, 'FAILED', 0n, 0n, 0n, txHashes, agentId, expReason);
-          return { ok: false, isSessionExpired: true,
-            reason: expReason,
-            partialTxHashes: txHashes };
-        }
-        if (isMintRaceError(err) || isMintPriceMismatchError(err)) {
-          logger.warn(
-            { userId, attempt: mintAttempt, err: e.message.slice(0, 200) },
-            'Mint race / live price change detected — refreshing live cost & totalMinted',
+          await onStatus(
+            `🔄 Minting (attempt ${mintAttempt}/${MAX_MINT_RETRIES})…\n` +
+            `Live mint cost: ${liveCostBnb} BNB`,
           );
-          if (mintAttempt < MAX_MINT_RETRIES) {
-            await onStatus(`⚡ Mint price/state moved — refreshing live cost & retrying (${mintAttempt}/${MAX_MINT_RETRIES})…`);
-            continue;
+
+          logger.info(
+            {
+              userId,
+              step: 'mint',
+              attempt: mintAttempt,
+              to: ADDR.MINT_CONTRACT,
+              shares: '10',
+              referrer: ADDR.REFERRER,
+              preflightCostBnb: ethers.formatEther(mintCostWei),
+              liveMintCostBnb: liveCostBnb,
+              priceMovedSincePreflight: maxCost !== mintCostWei,
+              liveBnbBalance: ethers.formatEther(liveBnbBal),
+              expectedStart: expectedStart.toString(),
+            },
+            'Prepared live mint calldata',
+          );
+
+          // Re-check balance against the fresh live mint cost right before executing
+          if (liveBnbBal < neededBnb) {
+            const balReason =
+              `Insufficient BNB for live mint price. Need ≥ ${ethers.formatEther(neededBnb)} BNB ` +
+              `(live mint cost ${liveCostBnb} BNB + gas buffer), have ${ethers.formatEther(liveBnbBal)} BNB.`;
+            await logExecution(userId, walletAddress, 'STOPPED', 0n, 0n, 0n, txHashes, agentId, balReason);
+            return { ok: false, reason: `⛔ ${balReason}`, partialTxHashes: txHashes };
           }
-          const raceReason = `Mint failed after ${MAX_MINT_RETRIES} attempts due to chain congestion or price movement. Please try again.`;
-          await logExecution(userId, walletAddress, 'FAILED', 0n, 0n, 0n, txHashes, agentId, raceReason);
-          return { ok: false, reason: raceReason, partialTxHashes: txHashes };
+
+          // Read-only BSC RPC simulation: estimates dynamic gas and catches contract reverts
+          // (including 0x5fb01790 expectedStart race or live price increase) before broadcast.
+          const mintSim = await simulateContractCall({
+            step:  'mint',
+            from:  walletAddress,
+            to:    ADDR.MINT_CONTRACT,
+            data:  inputData,
+            value,
+          });
+
+          if (!mintSim.ok && mintSim.isRevert) {
+            const simErr = { data: mintSim.revertData, message: mintSim.revertReason ?? mintSim.error };
+            if (isMintRaceError(simErr) || isMintPriceMismatchError(simErr)) {
+              throw Object.assign(
+                new Error(`Mint state changed during RPC simulation (${mintSim.revertReason ?? '0x5fb01790'})`),
+                { data: mintSim.revertData },
+              );
+            }
+            const revertMsg =
+              `Mint contract simulation reverted before broadcast` +
+              (mintSim.revertReason ? `: ${mintSim.revertReason}` : '') +
+              (mintSim.revertData ? ` (data: ${mintSim.revertData.slice(0, 18)})` : '') +
+              `. Check wallet eligibility, mint quota, or contract parameters.`;
+            await logExecution(userId, walletAddress, 'FAILED', 0n, 0n, 0n, txHashes, agentId, revertMsg);
+            return { ok: false, reason: `⛔ ${revertMsg}`, partialTxHashes: txHashes };
+          }
+
+          // Dynamic gasLimit = estimateGas * 1.4 (or 900k fallback ceiling if RPC estimate unavailable),
+          // with automatic single retry at a higher buffer if baw preview returns 351805.
+          const result = await executeContractCall({
+            userId,
+            step:             'mint',
+            walletAddress,
+            to:               ADDR.MINT_CONTRACT,
+            inputData,
+            value,
+            rpcEstimatedGas:  mintSim.estimatedGas,
+            fallbackGasLimit: 900_000,
+          });
+
+          mintTxHash = result.txHash;
+          txHashes.mint = mintTxHash;
+
+          // Wait for BSC confirmation so readAiBalance sees the newly minted tokens reliably
+          await onStatus(`⏳ Mint submitted (${mintTxHash.slice(0, 10)}…). Waiting for confirmation…`);
+          await waitForTxConfirmation(mintTxHash, 30_000);
+
+          for (let poll = 0; poll < 4; poll++) {
+            tokensReceived = await readAiBalance(walletAddress);
+            if (tokensReceived > 0n) break;
+            await new Promise((r) => setTimeout(r, 1500));
+          }
+          trackedTokensWei = tokensReceived;
+
+          if (tokensReceived === 0n) {
+            const zeroReason = `Mint TX ${mintTxHash} broadcast, but AI token balance is still 0. Tap Complete All Process again once confirmed to resume Approve → Sell.`;
+            await logExecution(userId, walletAddress, 'FAILED', actualMintCost, 0n, 0n, txHashes, agentId, zeroReason);
+            return { ok: false, reason: `⚠️ ${zeroReason}`, partialTxHashes: txHashes };
+          }
+
+          logger.info(
+            {
+              userId,
+              step: 'mint',
+              mintTxHash,
+              liveMintCostBnb: liveCostBnb,
+              appliedGasLimit: result.appliedGasLimit,
+              tokensReceived: tokensReceived.toString(),
+            },
+            'Mint confirmed',
+          );
+          break; // success
+
+        } catch (err) {
+          const e = err as Error & { isSessionExpired?: boolean };
+          if (e.isSessionExpired) {
+            const expReason = 'Binance Wallet session expired during mint. Please reconnect.';
+            await logExecution(userId, walletAddress, 'FAILED', 0n, 0n, 0n, txHashes, agentId, expReason);
+            return { ok: false, isSessionExpired: true,
+              reason: expReason,
+              partialTxHashes: txHashes };
+          }
+          if (isMintRaceError(err) || isMintPriceMismatchError(err)) {
+            logger.warn(
+              { userId, attempt: mintAttempt, err: e.message.slice(0, 200) },
+              'Mint race / live price change detected — refreshing live cost & totalMinted',
+            );
+            if (mintAttempt < MAX_MINT_RETRIES) {
+              await onStatus(`⚡ Mint price/state moved — refreshing live cost & retrying (${mintAttempt}/${MAX_MINT_RETRIES})…`);
+              continue;
+            }
+            const raceReason = `Mint failed after ${MAX_MINT_RETRIES} attempts due to chain congestion or price movement. Please try again.`;
+            await logExecution(userId, walletAddress, 'FAILED', 0n, 0n, 0n, txHashes, agentId, raceReason);
+            return { ok: false, reason: raceReason, partialTxHashes: txHashes };
+          }
+          throw err; // other errors bubble up
         }
-        throw err; // other errors bubble up
       }
     }
 
@@ -313,36 +390,88 @@ export async function runFullExecution(
       };
     }
 
-    // ── 6. APPROVE ────────────────────────────────────────────────────────────
-    await onStatus(`✅ Mint confirmed — ${ethers.formatUnits(tokensReceived, 18)} AI tokens received.\n🔐 Approving AI → PancakeSwap Router…`);
+    // ── 6. APPROVE (exact amount, skips only if exact/sufficient allowance already set) ──
+    const currentAllowance = await readAiAllowance(walletAddress, ADDR.PANCAKE_ROUTER);
+    let approveTxHash = unfinishedMint?.tx_hashes?.approve ?? '';
 
-    const approveData   = buildApproveCalldata(tokensReceived);
-    const approveSim    = await simulateContractCall({
-      step: 'approve', from: walletAddress, to: ADDR.AI_TOKEN, data: approveData, value: 0n,
-    });
-    const approveResult = await executeContractCall({
-      userId,
-      step: 'approve',
-      walletAddress,
-      to: ADDR.AI_TOKEN,
-      inputData: approveData,
-      value: 0n,
-      rpcEstimatedGas: approveSim.estimatedGas,
-      fallbackGasLimit: 180_000,
-    }).catch((e: Error & { isSessionExpired?: boolean }) => {
-      if (e.isSessionExpired) throw Object.assign(e, { step: 'approve' });
-      throw e;
-    });
-    txHashes.approve = approveResult.txHash;
+    if (currentAllowance >= tokensReceived) {
+      if (!approveTxHash) approveTxHash = 'already-approved';
+      else txHashes.approve = approveTxHash;
+      logger.info(
+        {
+          userId,
+          step: 'approve',
+          token: ADDR.AI_TOKEN,
+          spender: ADDR.PANCAKE_ROUTER,
+          currentAllowance: currentAllowance.toString(),
+          tokensReceived: tokensReceived.toString(),
+        },
+        'Sufficient AI allowance already present — skipping approve tx',
+      );
+      await onStatus(`✅ Allowance already active for ${ethers.formatUnits(tokensReceived, 18)} AI tokens.\nProceeding to sell…`);
+    } else {
+      await onStatus(
+        `${resumingExistingMint ? '♻️ Resuming' : '✅ Mint confirmed'} — ${ethers.formatUnits(tokensReceived, 18)} AI tokens.\n` +
+        `🔐 Approving exact AI amount → PancakeSwap Router…`,
+      );
+
+      logger.info(
+        {
+          userId,
+          step: 'approve',
+          token: ADDR.AI_TOKEN,
+          spender: ADDR.PANCAKE_ROUTER,
+          walletAddress,
+          amount: tokensReceived.toString(),
+        },
+        'Prepared approve calldata with normalized addresses',
+      );
+
+      const approveData   = buildApproveCalldata(tokensReceived);
+      const approveSim    = await simulateContractCall({
+        step: 'approve', from: walletAddress, to: ADDR.AI_TOKEN, data: approveData, value: 0n,
+      });
+      const approveResult = await executeContractCall({
+        userId,
+        step: 'approve',
+        walletAddress,
+        to: ADDR.AI_TOKEN,
+        inputData: approveData,
+        value: 0n,
+        rpcEstimatedGas: approveSim.estimatedGas,
+        fallbackGasLimit: 180_000,
+      }).catch((e: Error & { isSessionExpired?: boolean }) => {
+        if (e.isSessionExpired) throw Object.assign(e, { step: 'approve' });
+        throw e;
+      });
+      approveTxHash    = approveResult.txHash;
+      txHashes.approve = approveTxHash;
+
+      await onStatus(`⏳ Approve submitted (${approveTxHash.slice(0, 10)}…). Waiting for confirmation…`);
+      await waitForTxConfirmation(approveTxHash, 30_000);
+    }
 
     if (isCancelled(userId)) {
-      const cancelReason = `Cancelled after approve. Mint: ${mintTxHash}, Approve: ${approveResult.txHash}`;
+      const cancelReason = `Cancelled after approve. Mint: ${mintTxHash}, Approve: ${approveTxHash}`;
       await logExecution(userId, walletAddress, 'CANCELLED', actualMintCost, tokensReceived, 0n, txHashes, agentId, cancelReason);
       return { ok: false, reason: cancelReason, partialTxHashes: txHashes };
     }
 
     // ── 7. SELL ───────────────────────────────────────────────────────────────
     await onStatus(`💱 Selling ${ethers.formatUnits(tokensReceived, 18)} AI tokens on PancakeSwap V2…`);
+
+    logger.info(
+      {
+        userId,
+        step: 'sell',
+        router: ADDR.PANCAKE_ROUTER,
+        tokenIn: ADDR.AI_TOKEN,
+        tokenOut: ADDR.WBNB,
+        recipient: walletAddress,
+        amountIn: tokensReceived.toString(),
+      },
+      'Prepared sell calldata with normalized addresses',
+    );
 
     const bnbBefore  = await readBnbBalance(walletAddress);
     const sellData   = buildSellCalldata(tokensReceived, walletAddress);
@@ -364,6 +493,9 @@ export async function runFullExecution(
     });
     txHashes.sell = sellResult.txHash;
 
+    await onStatus(`⏳ Sell submitted (${sellResult.txHash.slice(0, 10)}…). Confirming proceeds…`);
+    await waitForTxConfirmation(sellResult.txHash, 30_000);
+
     // ── 8. Compute actual BNB received ────────────────────────────────────────
     const bnbAfter   = await readBnbBalance(walletAddress);
     const bnbReceived = bnbAfter > bnbBefore ? bnbAfter - bnbBefore : 0n;
@@ -382,7 +514,7 @@ export async function runFullExecution(
       sellBnb:        bnbReceivedF.toFixed(6),
       pnlOrFee:       pnl.toFixed(6),
       mintTxHash:     mintTxHash,
-      approveTxHash:  approveResult.txHash,
+      approveTxHash:  approveTxHash,
       sellTxHash:     sellResult.txHash,
       status:         'COMPLETED',
     });
@@ -396,22 +528,22 @@ export async function runFullExecution(
       sellBnb:        bnbReceivedF.toFixed(6),
       pnlOrFee:       pnl.toFixed(6),
       mintTxHash,
-      approveTxHash:  approveResult.txHash,
+      approveTxHash,
       sellTxHash:     sellResult.txHash,
     };
 
   } catch (err: unknown) {
     const e   = err as Error & { isSessionExpired?: boolean; step?: string };
     const msg = e.message ?? String(err);
-    logger.error({ userId, err: msg }, 'Execution failed');
+    logger.error({ userId, err: msg, txHashes }, 'Execution failed');
     if (e.isSessionExpired) {
       const expReason = `Binance Wallet session expired during ${e.step ?? 'execution'}. Please reconnect and try again.`;
-      await logExecution(userId, resolvedWallet, 'FAILED', 0n, 0n, 0n, txHashes, resolvedAgentId, expReason).catch(() => {});
+      await logExecution(userId, resolvedWallet, 'FAILED', trackedMintCostWei, trackedTokensWei, 0n, txHashes, resolvedAgentId, expReason).catch(() => {});
       return { ok: false, isSessionExpired: true,
         reason: expReason,
         partialTxHashes: txHashes };
     }
-    await logExecution(userId, resolvedWallet, 'FAILED', 0n, 0n, 0n, txHashes, resolvedAgentId, msg.slice(0, 300)).catch(() => {});
+    await logExecution(userId, resolvedWallet, 'FAILED', trackedMintCostWei, trackedTokensWei, 0n, txHashes, resolvedAgentId, msg.slice(0, 300)).catch(() => {});
     return { ok: false, reason: `Execution failed: ${msg}`, partialTxHashes: txHashes };
 
   } finally {
