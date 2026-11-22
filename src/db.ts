@@ -70,6 +70,7 @@ export async function initDb(): Promise<void> {
       CREATE TABLE IF NOT EXISTS executions (
         id               BIGSERIAL PRIMARY KEY,
         telegram_user_id BIGINT NOT NULL REFERENCES users(telegram_user_id) ON DELETE CASCADE,
+        wallet_address   TEXT,
         agent_id_name    TEXT,
         status           TEXT NOT NULL,
         mint_cost_bnb    NUMERIC,
@@ -87,6 +88,7 @@ export async function initDb(): Promise<void> {
     await client.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS qr_generated BOOLEAN NOT NULL DEFAULT FALSE`);
     await client.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS wallet_address TEXT`);
     await client.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS agent_id_name TEXT`);
+    await client.query(`ALTER TABLE executions ADD COLUMN IF NOT EXISTS wallet_address TEXT`);
 
     dbReady = true;
     logger.info('Database schema ready');
@@ -202,6 +204,7 @@ export async function cancelUser(userId: number): Promise<void> {
 export interface DbExecution {
   id: number;
   telegram_user_id: number;
+  wallet_address?: string | null;
   agent_id_name: string | null;
   status: string;
   mint_cost_bnb: string | null;
@@ -218,12 +221,13 @@ export async function insertExecution(
 ): Promise<number> {
   const { rows } = await pool.query<{ id: number }>(
     `INSERT INTO executions
-       (telegram_user_id, agent_id_name, status, mint_cost_bnb, tokens_received,
+       (telegram_user_id, wallet_address, agent_id_name, status, mint_cost_bnb, tokens_received,
         sell_bnb, pnl_or_fee, tx_hashes, summary)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
      RETURNING id`,
     [
       data.telegram_user_id,
+      data.wallet_address ?? null,
       data.agent_id_name,
       data.status,
       data.mint_cost_bnb,
@@ -236,6 +240,103 @@ export async function insertExecution(
   );
   dbReady = true;
   return rows[0].id;
+}
+
+// ─── One-time completed Agent ID / Wallet lock (DB-authoritative + memory fallback) ─
+// Strictly keyed by normalized agentIdName (*.ai) and/or walletAddress — NEVER by
+// telegram_user_id, so one Telegram user can freely run multiple cycles across
+// different Agent IDs or different Agent Wallets.
+
+const completedAgentIdsMem = new Set<string>();
+const completedWalletsMem  = new Set<string>();
+
+export function recordCompletedAgentInMemory(opts: {
+  agentIdName?: string | null;
+  walletAddress?: string | null;
+}): void {
+  const agent = opts.agentIdName?.trim().toLowerCase();
+  if (agent) completedAgentIdsMem.add(agent);
+  const wallet = opts.walletAddress?.trim().toLowerCase();
+  if (wallet) completedWalletsMem.add(wallet);
+}
+
+export interface CompletedAgentCheckResult {
+  completed: boolean;
+  matchedBy?: 'agent_id' | 'wallet_address';
+}
+
+/**
+ * Checks whether a full cycle (sell confirmed / status = 'COMPLETED') has
+ * already finished for this Agent ID (`agentIdName`, e.g. `*.ai`) and/or
+ * Agent Wallet (`walletAddress`).
+ *
+ * Strictly ignores Telegram `userId` (allowing one Telegram account to run
+ * different Agent IDs / wallets) and strictly ignores CANCELLED, STOPPED,
+ * FAILED, or incomplete mint-only rows so unfinished runs can resume cleanly.
+ */
+export async function hasCompletedCycleForAgent(opts: {
+  agentIdName?: string | null;
+  walletAddress?: string | null;
+}): Promise<CompletedAgentCheckResult> {
+  const agent  = opts.agentIdName?.trim().toLowerCase() || null;
+  const wallet = opts.walletAddress?.trim().toLowerCase() || null;
+
+  if (!agent && !wallet) {
+    return { completed: false };
+  }
+
+  // Fast in-memory check (also protects when DB is temporarily degraded)
+  if (agent && completedAgentIdsMem.has(agent)) {
+    return { completed: true, matchedBy: 'agent_id' };
+  }
+  if (wallet && completedWalletsMem.has(wallet)) {
+    return { completed: true, matchedBy: 'wallet_address' };
+  }
+
+  try {
+    // Check genuinely completed execution records (status = 'COMPLETED' with confirmed sell)
+    // strictly matching e.agent_id_name or e.wallet_address (never telegram_user_id).
+    const { rows } = await pool.query<{
+      matched_agent: boolean;
+      matched_wallet: boolean;
+    }>(
+      `SELECT
+         BOOL_OR($1::text IS NOT NULL AND LOWER(COALESCE(e.agent_id_name, '')) = $1) AS matched_agent,
+         BOOL_OR(
+           $2::text IS NOT NULL AND (
+             LOWER(COALESCE(e.wallet_address, '')) = $2 OR
+             LOWER(COALESCE(e.agent_id_name, '')) = $2
+           )
+         ) AS matched_wallet
+       FROM executions e
+       WHERE e.status = 'COMPLETED'
+         AND COALESCE(e.tx_hashes->>'sell', '') <> ''
+         AND (
+           ($1::text IS NOT NULL AND LOWER(COALESCE(e.agent_id_name, '')) = $1)
+           OR ($2::text IS NOT NULL AND (
+                LOWER(COALESCE(e.wallet_address, '')) = $2 OR
+                LOWER(COALESCE(e.agent_id_name, '')) = $2
+              ))
+         )`,
+      [agent, wallet],
+    );
+    dbReady = true;
+
+    const r = rows[0];
+    if (r?.matched_agent) {
+      recordCompletedAgentInMemory({ agentIdName: agent });
+      return { completed: true, matchedBy: 'agent_id' };
+    }
+    if (r?.matched_wallet) {
+      recordCompletedAgentInMemory({ walletAddress: wallet });
+      return { completed: true, matchedBy: 'wallet_address' };
+    }
+
+    return { completed: false };
+  } catch (err) {
+    logger.warn({ err, agent, wallet }, 'hasCompletedCycleForAgent: DB check failed (using in-memory state)');
+    return { completed: false };
+  }
 }
 
 export async function getUserExecutions(
@@ -256,7 +357,9 @@ export async function getUserExecutions(
  */
 export async function getLatestUnfinishedMint(
   userId: number,
+  walletAddress?: string | null,
 ): Promise<DbExecution | null> {
+  const wallet = walletAddress?.trim().toLowerCase() || null;
   try {
     const { rows } = await pool.query<DbExecution>(
       `SELECT *
@@ -266,9 +369,10 @@ export async function getLatestUnfinishedMint(
          AND tx_hashes IS NOT NULL
          AND tx_hashes->>'mint' IS NOT NULL
          AND tx_hashes->>'sell' IS NULL
+         AND ($2::text IS NULL OR wallet_address IS NULL OR LOWER(wallet_address) = $2)
        ORDER BY created_at DESC
        LIMIT 1`,
-      [userId],
+      [userId, wallet],
     );
     dbReady = true;
     return rows[0] ?? null;

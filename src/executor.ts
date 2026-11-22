@@ -41,10 +41,18 @@ import {
   isSessionConnectedDb, executeContractCall, getSession, fetchBawAgentId, getBawWalletSettings, syncAgentId,
 } from './wallet.js';
 import { generateExecutionSummary } from './gemini.js';
-import { insertExecution, getLatestUnfinishedMint, pool } from './db.js';
+import {
+  insertExecution,
+  getLatestUnfinishedMint,
+  hasCompletedCycleForAgent,
+  recordCompletedAgentInMemory,
+  pool,
+} from './db.js';
 import { logger } from './logger.js';
 
 // ─── Constants ────────────────────────────────────────────────────────────────
+
+export const ALREADY_COMPLETED_MESSAGE = 'আহা অশান্তি একটা আইডি দিয়ে কতবার করতে চাচ্ছেন?';
 
 const RETRY_BASE_DELAY_MS  = 1_500; // initial backoff on smart contract call failure
 const RETRY_STEP_DELAY_MS  = 500;   // linear backoff increment per attempt
@@ -122,6 +130,7 @@ export interface ExecutionSuccess {
 export interface ExecutionFailure {
   ok: false;
   reason: string;
+  alreadyCompleted?: boolean;
   isSessionExpired?: boolean;
   partialTxHashes?: Partial<Record<'mint' | 'approve' | 'sell', string>>;
 }
@@ -179,13 +188,26 @@ export async function runFullExecution(
       walletAddress;
     resolvedAgentId = agentId;
 
+    // ── 1b. One-time completed Agent ID / Agent Wallet lock (NEVER keyed by Telegram userId) ──
+    const earlyLockCheck = await hasCompletedCycleForAgent({
+      agentIdName: isValidAiAgentId(agentId) ? agentId : null,
+      walletAddress,
+    });
+    if (earlyLockCheck.completed) {
+      logger.info(
+        { userId, walletAddress, agentId, matchedBy: earlyLockCheck.matchedBy },
+        'Blocked execution: Agent ID / Agent Wallet already completed a full cycle',
+      );
+      return { ok: false, alreadyCompleted: true, reason: ALREADY_COMPLETED_MESSAGE };
+    }
+
     // ── 2. Read live mint cost, wallet settings, & check for existing unsold mint ──
     await onStatus('📡 Reading live mint cost, AI balance & wallet settings…');
     const [mintCostWei, bawSettingsRes, existingAiBalance, unfinishedMint] = await Promise.all([
       readCostOf(10n),
       getBawWalletSettings(userId),
       readAiBalance(walletAddress),
-      getLatestUnfinishedMint(userId),
+      getLatestUnfinishedMint(userId, walletAddress),
     ]);
 
     const resumingExistingMint = existingAiBalance > 0n;
@@ -218,6 +240,19 @@ export async function runFullExecution(
       agentId = preflight.resolvedAgentId;
       resolvedAgentId = agentId;
       await syncAgentId(userId, agentId);
+
+      // Re-verify completed Agent ID / Agent Wallet lock if preflight resolved a *.ai Agent ID
+      const resolvedLockCheck = await hasCompletedCycleForAgent({
+        agentIdName: agentId,
+        walletAddress,
+      });
+      if (resolvedLockCheck.completed) {
+        logger.info(
+          { userId, walletAddress, agentId, matchedBy: resolvedLockCheck.matchedBy },
+          'Blocked execution after preflight: resolved Agent ID / Wallet already completed a full cycle',
+        );
+        return { ok: false, alreadyCompleted: true, reason: ALREADY_COMPLETED_MESSAGE };
+      }
     }
     if (!preflight.ok) {
       const reason = preflight.reason ?? 'Preflight check failed.';
@@ -838,6 +873,7 @@ async function logExecution(
 
     await insertExecution({
       telegram_user_id: userId,
+      wallet_address:   walletAddress?.trim() || null,
       agent_id_name:    agentIdName,
       status,
       mint_cost_bnb:    mintCostBnb !== 0 ? mintCostBnb.toFixed(8) : null,
@@ -850,6 +886,7 @@ async function logExecution(
     });
 
     if (status === 'COMPLETED') {
+      recordCompletedAgentInMemory({ agentIdName, walletAddress });
       await pool.query(
         'UPDATE users SET completed_count = completed_count + 1, last_active_at = now() WHERE telegram_user_id = $1',
         [userId],

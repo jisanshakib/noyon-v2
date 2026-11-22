@@ -351,7 +351,11 @@ export async function markSessionConnected(
       `UPDATE users
        SET is_wallet_connected = TRUE,
            wallet_address      = $2,
-           agent_id_name       = COALESCE(NULLIF($3, ''), agent_id_name),
+           agent_id_name       = CASE
+             WHEN LOWER(COALESCE(wallet_address, '')) = LOWER($2)
+               THEN COALESCE(NULLIF($3, ''), agent_id_name)
+             ELSE NULLIF($3, '')
+           END,
            current_step        = 'connected',
            last_active_at      = now()
        WHERE telegram_user_id = $1`,

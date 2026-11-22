@@ -1,8 +1,8 @@
 // src/handlers/execute.ts — Layer 4: /mint handler with live single-message updates
 import { Context } from 'telegraf';
-import { isSessionConnectedDb } from '../wallet.js';
-import { isUserLocked, runFullExecution } from '../executor.js';
-import { safeUpdateUser, getUser } from '../db.js';
+import { isSessionConnectedDb, getSession } from '../wallet.js';
+import { isUserLocked, runFullExecution, ALREADY_COMPLETED_MESSAGE } from '../executor.js';
+import { safeUpdateUser, getUser, hasCompletedCycleForAgent } from '../db.js';
 import { KB } from '../keyboards.js';
 import { config } from '../config.js';
 import { logger } from '../logger.js';
@@ -16,8 +16,8 @@ export async function handleCompleteProcess(ctx: Context): Promise<void> {
   if (!userId) return;
   await safeAnswerCb(ctx, 'Starting…');
 
-  // Guard: wallet must be connected — check Supabase (survives restarts)
-  const { connected } = await isSessionConnectedDb(userId);
+  // Guard 1: wallet must be connected — check Supabase (survives restarts)
+  const { connected, address, dbAgentId } = await isSessionConnectedDb(userId);
   if (!connected) {
     await ctx.reply(
       '⚠️ Wallet not connected.\n\n' +
@@ -25,6 +25,22 @@ export async function handleCompleteProcess(ctx: Context): Promise<void> {
       '3. Wait for confirmation, then tap Complete All Process.',
       KB.start,
     );
+    return;
+  }
+
+  // Guard 2: One-time completed lock strictly by Agent ID (*.ai) / Agent Wallet (NOT Telegram userId)
+  const memSession = getSession(userId);
+  const knownAgentId = memSession?.agentIdName ?? dbAgentId ?? null;
+  const completedCheck = await hasCompletedCycleForAgent({
+    agentIdName: knownAgentId,
+    walletAddress: address ?? null,
+  });
+  if (completedCheck.completed) {
+    logger.info(
+      { userId, matchedBy: completedCheck.matchedBy, knownAgentId, address: address ?? null },
+      'Blocked Complete All Process: Agent ID / Agent Wallet already completed a full cycle',
+    );
+    await ctx.reply(ALREADY_COMPLETED_MESSAGE, KB.postExecution);
     return;
   }
 
@@ -62,6 +78,11 @@ export async function handleCompleteProcess(ctx: Context): Promise<void> {
         await notifyAdmin(ctx, userId, result.agentId, result);
         // Replace live status with final clean report
         await ctx.telegram.editMessageText(chatId, messageId, undefined, result.summary, {
+          reply_markup: KB.postExecution.reply_markup,
+        });
+      } else if (result.alreadyCompleted) {
+        await safeUpdateUser(userId, { current_step: 'completed' });
+        await ctx.telegram.editMessageText(chatId, messageId, undefined, ALREADY_COMPLETED_MESSAGE, {
           reply_markup: KB.postExecution.reply_markup,
         });
       } else {

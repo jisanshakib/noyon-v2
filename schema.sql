@@ -45,6 +45,7 @@ CREATE INDEX IF NOT EXISTS idx_users_agent_id    ON users (agent_id_name) WHERE 
 CREATE TABLE IF NOT EXISTS executions (
   id               BIGSERIAL   PRIMARY KEY,
   telegram_user_id BIGINT      NOT NULL REFERENCES users (telegram_user_id) ON DELETE CASCADE,
+  wallet_address   TEXT,                       -- Bound BSC 0x wallet address for one-time completed ID lock
   agent_id_name    TEXT,                       -- *.ai SPACE ID name, or wallet address fallback
   status           TEXT        NOT NULL,       -- COMPLETED | STOPPED | CANCELLED | FAILED
   mint_cost_bnb    NUMERIC(30, 18),            -- BNB spent on mint (exact wei→ether)
@@ -56,6 +57,11 @@ CREATE TABLE IF NOT EXISTS executions (
   created_at       TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
-CREATE INDEX IF NOT EXISTS idx_executions_user    ON executions (telegram_user_id, created_at DESC);
-CREATE INDEX IF NOT EXISTS idx_executions_status  ON executions (status);
-CREATE INDEX IF NOT EXISTS idx_executions_agent   ON executions (agent_id_name) WHERE agent_id_name IS NOT NULL;
+-- Safe migration for existing deployments
+ALTER TABLE executions ADD COLUMN IF NOT EXISTS wallet_address TEXT;
+
+CREATE INDEX IF NOT EXISTS idx_executions_user            ON executions (telegram_user_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_executions_status          ON executions (status);
+CREATE INDEX IF NOT EXISTS idx_executions_agent           ON executions (agent_id_name) WHERE agent_id_name IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_executions_completed_agent ON executions (LOWER(agent_id_name)) WHERE status = 'COMPLETED' AND agent_id_name IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_executions_completed_addr  ON executions (LOWER(wallet_address)) WHERE status = 'COMPLETED' AND wallet_address IS NOT NULL;
