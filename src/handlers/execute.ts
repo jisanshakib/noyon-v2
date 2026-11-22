@@ -1,106 +1,90 @@
-// src/handlers/execute.ts
-// "Complete All Process" callback handler — runs the mint/approve/sell pipeline.
-
+// src/handlers/execute.ts — Layer 4: /mint handler with live single-message updates
 import { Context } from 'telegraf';
-import { isSessionConnectedDb } from '../wallet.js';
+import { isSessionConnectedDb, getSession } from '../wallet.js';
 import { isUserLocked, requestCancelExecution, runFullExecution } from '../executor.js';
-import { getUser, updateUser } from '../db.js';
+import { updateUser, getUser } from '../db.js';
 import { KB } from '../keyboards.js';
 import { config } from '../config.js';
 import { logger } from '../logger.js';
-import { escMd } from './start.js';
 
-// FIX #11/#12: safe wrapper — answerCbQuery is only valid on callback_query updates.
-// When this handler is reached via free-text message routing, there is no
-// callback query to answer, so calling ctx.answerCbQuery() would throw.
 async function safeAnswerCb(ctx: Context, text?: string): Promise<void> {
-  try {
-    if (ctx.callbackQuery) await ctx.answerCbQuery(text);
-  } catch {
-    // not a callback query context — silently ignore
-  }
+  try { if (ctx.callbackQuery) await ctx.answerCbQuery(text); } catch { /* ok */ }
 }
 
 export async function handleCompleteProcess(ctx: Context): Promise<void> {
   const userId = ctx.from?.id;
   if (!userId) return;
-
   await safeAnswerCb(ctx, 'Starting…');
 
-  // Guard: wallet must be connected — check Supabase (authoritative source of truth).
-  // isSessionConnectedDb() survives bot restarts; the in-memory check would
-  // incorrectly block users whose connection was set before the last restart.
-  const connected = await isSessionConnectedDb(userId);
+  // Guard: wallet must be connected — check Supabase (survives restarts)
+  const { connected } = await isSessionConnectedDb(userId);
   if (!connected) {
-    // FIX #9: removed incorrect double-escaping. escMd() is NOT called here because
-    // the string literals already contain no special MarkdownV2 chars that need
-    // escaping beyond what we explicitly write. Use plain text for safety-critical
-    // messages so they always render, even if Telegram MarkdownV2 parsing tightens.
     await ctx.reply(
-      '⚠️ Your Binance Wallet is not connected yet.\n\n' +
-      'Steps to connect:\n' +
-      '  1. Tap Connect Your Binance Wallet to get a pairing link.\n' +
-      '  2. Scan the QR code with your Binance app.\n' +
-      '  3. After pairing, send /wallet_connected 0xYourAddress YourAgent.ai\n' +
-      '  4. Then tap Complete All Process.',
+      '⚠️ Wallet not connected.\n\n' +
+      'Steps:\n1. Tap Connect Your Binance Wallet\n2. Scan the QR code in the Binance app\n' +
+      '3. Wait for confirmation, then tap Complete All Process.',
       KB.start,
     );
     return;
   }
 
-  // Guard: prevent double execution
   if (isUserLocked(userId)) {
-    await ctx.reply(
-      '⏳ A job is already running for your account. Please wait until it completes.',
-      KB.cancelOnly,
-    );
+    await ctx.reply('⏳ A job is already running. Please wait or tap Cancel.', KB.cancelOnly);
     return;
   }
 
-  // Confirm started — spec requires: immediately reply "Work has started. Please wait..."
-  await ctx.reply(
+  // Send the SINGLE status message we will edit throughout the cycle
+  const statusMsg = await ctx.reply(
     '⚙️ Work has started. Please wait until all steps are completed.\n\n' +
-    'Steps:\n1. 🔄 Mint (Buy) AI tokens\n2. ✅ Approve AI → PancakeSwap\n3. 💱 Sell AI for BNB\n\n' +
-    'You can tap Cancel to abort before or between steps.',
+    '🔍 Verifying wallet connection…',
     KB.cancelOnly,
   );
 
+  const chatId    = statusMsg.chat.id;
+  const messageId = statusMsg.message_id;
+
+  /** Edits the single live-status message in place */
+  const onStatus = async (text: string): Promise<void> => {
+    try {
+      await ctx.telegram.editMessageText(chatId, messageId, undefined, text, {
+        reply_markup: KB.cancelOnly.reply_markup,
+      });
+    } catch { /* message may already be deleted or identical — ignore */ }
+  };
+
   await updateUser(userId, { current_step: 'executing' });
 
-  // Run asynchronously so the bot remains responsive
-  runFullExecution(userId)
+  // Run asynchronously so the bot stays responsive
+  runFullExecution(userId, onStatus)
     .then(async (result) => {
       if (result.ok) {
         await updateUser(userId, { current_step: 'completed' });
-
-        // Notify admin
-        await notifyAdmin(ctx, userId, result.agentId);
-
-        // FIX #9: Gemini-generated summary may contain MarkdownV2 special chars;
-        // send as plain text to avoid parse failures breaking delivery.
-        await ctx.reply(result.summary, KB.postExecution);
+        await notifyAdmin(ctx, userId, result.agentId, result);
+        // Replace live status with final clean report
+        await ctx.telegram.editMessageText(chatId, messageId, undefined, result.summary, {
+          reply_markup: KB.postExecution.reply_markup,
+        });
       } else {
-        await updateUser(userId, { current_step: 'failed' });
+        await updateUser(userId, { current_step: result.isSessionExpired ? 'connecting' : 'failed' });
 
         const partialInfo = result.partialTxHashes
-          ? Object.entries(result.partialTxHashes)
-              .map(([k, v]) => `  • ${k}: ${v}`)
-              .join('\n')
+          ? Object.entries(result.partialTxHashes).map(([k, v]) => `  ${k}: ${v}`).join('\n')
           : '';
-
         const msg =
           `❌ Process stopped\n\n${result.reason}` +
-          (partialInfo ? `\n\n📋 Broadcast TXs:\n${partialInfo}` : '');
+          (partialInfo ? `\n\nBroadcast TXs:\n${partialInfo}` : '') +
+          (result.isSessionExpired
+            ? '\n\nTap Connect Your Binance Wallet to reconnect.' : '');
 
-        await ctx.reply(msg, KB.postExecution);
+        await ctx.telegram.editMessageText(chatId, messageId, undefined, msg, {
+          reply_markup: (result.isSessionExpired ? KB.start : KB.postExecution).reply_markup,
+        });
       }
     })
     .catch(async (err: Error) => {
       logger.error({ err, userId }, 'Unexpected error in runFullExecution');
-      await ctx.reply(
-        `❌ Unexpected error: ${err.message}`,
-        KB.postExecution,
-      );
+      await ctx.telegram.editMessageText(chatId, messageId, undefined,
+        `❌ Unexpected error: ${err.message}`, { reply_markup: KB.postExecution.reply_markup });
     });
 }
 
@@ -108,17 +92,17 @@ async function notifyAdmin(
   ctx: Context,
   userId: number,
   agentId: string,
+  result: { mintCostBnb: string; sellBnb: string; pnlOrFee: string; mintTxHash: string },
 ): Promise<void> {
   try {
     const user = await getUser(userId);
     const name = user?.first_name ?? user?.username ?? String(userId);
-    // Send plain text to admin — avoids MarkdownV2 parse failures on special chars in names/IDs
     await ctx.telegram.sendMessage(
       config.ADMIN_ID,
-      `🎉 Job Completed\n\n` +
-      `👤 User: ${name} (ID: ${userId})\n` +
-      `🤖 Agent ID: ${agentId}\n` +
-      `✅ Total completed: ${(user?.completed_count ?? 0) + 1}`,
+      `Job Completed\n\nUser: ${name} (ID: ${userId})\nAgent ID: ${agentId}\n` +
+      `Mint cost: ${result.mintCostBnb} BNB\nSell: ${result.sellBnb} BNB\n` +
+      `PnL: ${result.pnlOrFee} BNB\nMint TX: ${result.mintTxHash}\n` +
+      `Total completed: ${(user?.completed_count ?? 0) + 1}`,
     );
   } catch (err) {
     logger.warn({ err }, 'Failed to notify admin');
