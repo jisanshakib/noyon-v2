@@ -587,9 +587,26 @@ export interface ContractCallResult {
   requestId: string;
 }
 
+const BAW_MIN_GAS_LIMIT = 21_000;
+const BAW_MAX_GAS_LIMIT = 15_000_000;
+
+function clampGasLimit(gas: number): number {
+  return Math.min(BAW_MAX_GAS_LIMIT, Math.max(BAW_MIN_GAS_LIMIT, Math.ceil(gas)));
+}
+
+function isOutOfGasPreviewError(err: unknown): boolean {
+  const msg = String((err as Error)?.message ?? err ?? '');
+  return /351805|ran out of gas|out of gas|increase the gas limit/i.test(msg);
+}
+
 /**
  * Executes a contract call through the user's Binance Agentic Wallet.
  * Two phases: preview (get requestId) → execute (submit via MPC signer).
+ *
+ * Per @binance/agentic-wallet CLI docs, `--gasLimit` is a hard simulation ceiling
+ * (21000–15000000); omit it to let the Binance backend auto-estimate. If `preview`
+ * still fails with code 351805 (ran out of gas), we automatically retry preview once
+ * with a buffered gas limit derived from `rpcEstimatedGas` / `fallbackGasLimit`.
  *
  * Session expiry is detected and the error is tagged `isSessionExpired=true`
  * so the caller can prompt re-connection.
@@ -600,11 +617,27 @@ export async function executeContractCall(opts: {
   userId: number;
   walletAddress: string;
   to: string;
-  inputData: string;   // 0x-prefixed calldata
-  value?: bigint;      // wei (default 0)
-  gasLimit?: number;
+  inputData: string;        // 0x-prefixed calldata
+  value?: bigint;           // wei (default 0)
+  gasLimit?: number;        // optional explicit cap; omit for baw backend auto-estimate
+  step?: string;            // diagnostic label: 'mint' | 'approve' | 'sell'
+  rpcEstimatedGas?: bigint; // optional BSC RPC estimateGas result for buffered fallback
+  fallbackGasLimit?: number;// buffered gas limit used if baw preview returns 351805
 }): Promise<ContractCallResult> {
-  const { userId, walletAddress, to, inputData, value = 0n, gasLimit } = opts;
+  const {
+    userId,
+    walletAddress,
+    to,
+    inputData,
+    value = 0n,
+    gasLimit,
+    step = 'contract-call',
+    rpcEstimatedGas,
+    fallbackGasLimit = 1_200_000,
+  } = opts;
+
+  const fnSelector    = inputData.slice(0, 10);
+  const calldataBytes = Math.max(0, (inputData.length - 2) / 2);
 
   // Serialize per-user to prevent nonce races
   const prev = execLocks.get(userId) ?? Promise.resolve();
@@ -615,22 +648,112 @@ export async function executeContractCall(opts: {
   try {
     await prev; // wait for any previous call to finish
 
-    // Phase 1: preview
-    const previewArgs = [
-      'contract-call', 'preview',
-      '--binanceChainId', '56',
-      '--from', walletAddress,
-      '--to', to,
-      '--value', value.toString(),
-      '--inputData', inputData,
-      ...(gasLimit != null ? ['--gasLimit', String(gasLimit)] : []),
-    ];
-    const previewRaw = await callBaw(previewArgs, userId, 30_000) as Record<string, unknown>;
+    const runPreview = async (effectiveGasLimit?: number): Promise<Record<string, unknown>> => {
+      const args = [
+        'contract-call', 'preview',
+        '--binanceChainId', '56',
+        '--from', walletAddress,
+        '--to', to,
+        '--value', value.toString(),
+        '--inputData', inputData,
+        ...(effectiveGasLimit != null ? ['--gasLimit', String(clampGasLimit(effectiveGasLimit))] : []),
+      ];
+
+      logger.info(
+        {
+          userId,
+          step,
+          to,
+          fnSelector,
+          calldataBytes,
+          valueWei: value.toString(),
+          rpcEstimatedGas: rpcEstimatedGas?.toString() ?? null,
+          gasLimit: effectiveGasLimit != null ? clampGasLimit(effectiveGasLimit) : 'auto(baw-backend)',
+        },
+        'baw contract-call preview request',
+      );
+
+      return (await callBaw(args, userId, 30_000)) as Record<string, unknown>;
+    };
+
+    // Phase 1: preview (omit --gasLimit by default so baw backend estimates; retry with buffered cap on 351805)
+    let previewRaw: Record<string, unknown>;
+    let gasUsedForPreview: number | 'auto' = gasLimit != null ? clampGasLimit(gasLimit) : 'auto';
+
+    try {
+      previewRaw = await runPreview(gasLimit);
+    } catch (previewErr) {
+      const e = previewErr as Error & { isSessionExpired?: boolean };
+      if (e.isSessionExpired) throw e;
+
+      if (isOutOfGasPreviewError(previewErr)) {
+        const rpcBuffered = rpcEstimatedGas != null ? Math.ceil(Number(rpcEstimatedGas) * 1.5) : 0;
+        const capBumped   = gasLimit != null ? Math.ceil(gasLimit * 2) : 0;
+        const retryGas    = clampGasLimit(Math.max(rpcBuffered, fallbackGasLimit, capBumped));
+
+        logger.warn(
+          {
+            userId,
+            step,
+            to,
+            fnSelector,
+            initialGasLimit: gasUsedForPreview,
+            retryGasLimit: retryGas,
+            rpcEstimatedGas: rpcEstimatedGas?.toString() ?? null,
+            err: e.message.slice(0, 240),
+          },
+          'baw contract-call preview hit out-of-gas (351805) — retrying with buffered gasLimit',
+        );
+
+        gasUsedForPreview = retryGas;
+        try {
+          previewRaw = await runPreview(retryGas);
+        } catch (retryErr) {
+          const re = retryErr as Error & { isSessionExpired?: boolean };
+          if (re.isSessionExpired) throw re;
+          logger.error(
+            {
+              userId,
+              step,
+              to,
+              fnSelector,
+              retryGasLimit: retryGas,
+              rpcEstimatedGas: rpcEstimatedGas?.toString() ?? null,
+              err: re.message.slice(0, 300),
+            },
+            'baw contract-call preview failed even with buffered gasLimit',
+          );
+          throw new Error(
+            `[${step}] preview failed on ${to} (gasLimit=${retryGas}): ${re.message}`,
+          );
+        }
+      } else {
+        logger.error(
+          { userId, step, to, fnSelector, gasLimit: gasUsedForPreview, err: e.message.slice(0, 300) },
+          'baw contract-call preview failed',
+        );
+        throw previewErr;
+      }
+    }
+
     const previewPayload = unwrap(previewRaw);
     const requestId  = String(previewPayload.requestId ?? previewPayload.request_id ?? '');
-    if (!requestId) throw new Error(`baw contract-call preview returned no requestId: ${JSON.stringify(previewRaw).slice(0, 200)}`);
+    if (!requestId) {
+      throw new Error(`baw contract-call preview returned no requestId: ${JSON.stringify(previewRaw).slice(0, 200)}`);
+    }
 
-    logger.info({ userId, requestId, to }, 'contract-call preview ok');
+    logger.info(
+      {
+        userId,
+        step,
+        requestId,
+        to,
+        fnSelector,
+        gasLimitSent: gasUsedForPreview,
+        previewGasLimit: previewPayload.gasLimit ?? previewPayload.estimatedGas ?? null,
+      },
+      'contract-call preview ok',
+    );
 
     // Phase 2: execute
     const execRaw = await callBaw(['contract-call', 'execute', '--requestId', requestId], userId, 60_000) as Record<string, unknown>;
@@ -642,7 +765,7 @@ export async function executeContractCall(opts: {
       throw new Error(`baw contract-call execute returned invalid txHash: ${JSON.stringify(execRaw).slice(0, 200)}`);
     }
 
-    logger.info({ userId, txHash, requestId }, 'contract-call execute ok');
+    logger.info({ userId, step, txHash, requestId }, 'contract-call execute ok');
     return { txHash, requestId };
   } finally {
     releaseLock();

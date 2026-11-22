@@ -458,6 +458,95 @@ export function isMintRaceError(err: unknown): boolean {
   );
 }
 
+export interface RpcSimulationResult {
+  ok: boolean;
+  estimatedGas?: bigint;
+  isRevert?: boolean;
+  revertData?: string;
+  revertReason?: string;
+  error?: string;
+}
+
+/**
+ * Runs a read-only BSC RPC `eth_estimateGas` simulation before calling `baw`.
+ * Surfaces real contract reverts (e.g. 0x5fb01790 expectedStart race or custom errors)
+ * and provides an on-chain gas estimate for diagnostics and buffered retry if needed.
+ */
+export async function simulateContractCall(opts: {
+  step: string;
+  from: string;
+  to: string;
+  data: string;
+  value?: bigint;
+}): Promise<RpcSimulationResult> {
+  const { step, from, to, data, value = 0n } = opts;
+  const fnSelector = data.slice(0, 10);
+
+  try {
+    const estimatedGas = await provider.estimateGas({ from, to, data, value });
+    logger.info(
+      {
+        step,
+        to,
+        fnSelector,
+        valueBnb: ethers.formatEther(value),
+        estimatedGas: estimatedGas.toString(),
+      },
+      'BSC RPC estimateGas succeeded',
+    );
+    return { ok: true, estimatedGas };
+  } catch (err: unknown) {
+    const e = err as {
+      code?: string;
+      data?: string;
+      reason?: string;
+      shortMessage?: string;
+      message?: string;
+      info?: { error?: { data?: string; message?: string } };
+    };
+    const revertData =
+      typeof e?.data === 'string' && e.data.startsWith('0x') && e.data.length > 2
+        ? e.data
+        : typeof e?.info?.error?.data === 'string' && e.info.error.data.startsWith('0x') && e.info.error.data.length > 2
+          ? e.info.error.data
+          : undefined;
+    const rawMsg = e?.shortMessage ?? e?.message ?? String(err);
+    const revertReason =
+      e?.reason ??
+      e?.info?.error?.message ??
+      (revertData ? `custom error ${revertData.slice(0, 10)}` : undefined);
+
+    const isRevert = Boolean(
+      e?.code === 'CALL_EXCEPTION' ||
+      revertData ||
+      /revert|execution reverted|invalid opcode/i.test(rawMsg),
+    );
+
+    logger.warn(
+      {
+        step,
+        to,
+        fnSelector,
+        valueBnb: ethers.formatEther(value),
+        code: e?.code ?? null,
+        isRevert,
+        revertData: revertData ? revertData.slice(0, 74) : null,
+        revertReason: revertReason ?? null,
+        error: rawMsg.slice(0, 240),
+      },
+      'BSC RPC estimateGas failed',
+    );
+
+    return {
+      ok: false,
+      isRevert,
+      revertData,
+      revertReason,
+      error: rawMsg,
+    };
+  }
+}
+
 /** Returns gasPrice for LOW/MEDIUM priority (+5% above base) */
 export async function getLowGasPrice(): Promise<bigint> {
   const feeData = await provider.getFeeData();

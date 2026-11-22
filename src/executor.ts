@@ -22,7 +22,7 @@
 import { ethers } from 'ethers';
 import {
   readCostOf, readBnbBalance, readAiBalance,
-  runPreflightChecks, simulateSellOutput, isValidAiAgentId,
+  runPreflightChecks, simulateSellOutput, simulateContractCall, isValidAiAgentId,
   buildMintCalldata, buildApproveCalldata, buildSellCalldata,
   isMintRaceError, ADDR,
 } from './bsc.js';
@@ -166,16 +166,58 @@ export async function runFullExecution(
       );
 
       try {
-        const { inputData, value, maxCost } = await buildMintCalldata(10n);
+        const { inputData, value, maxCost, expectedStart } = await buildMintCalldata(10n);
         actualMintCost = maxCost;
 
+        logger.info(
+          {
+            userId,
+            attempt: mintAttempt,
+            to: ADDR.MINT_CONTRACT,
+            shares: '10',
+            referrer: ADDR.REFERRER,
+            maxCostBnb: ethers.formatEther(maxCost),
+            expectedStart: expectedStart.toString(),
+          },
+          'Prepared mint calldata',
+        );
+
+        // Read-only BSC RPC simulation: detects contract reverts (including 0x5fb01790 race)
+        // and captures estimatedGas before submitting to baw.
+        const mintSim = await simulateContractCall({
+          step:  'mint',
+          from:  walletAddress,
+          to:    ADDR.MINT_CONTRACT,
+          data:  inputData,
+          value,
+        });
+
+        if (!mintSim.ok && mintSim.isRevert) {
+          if (isMintRaceError({ data: mintSim.revertData, message: mintSim.revertReason ?? mintSim.error })) {
+            throw Object.assign(
+              new Error(`Mint race detected during RPC simulation (${mintSim.revertReason ?? '0x5fb01790'})`),
+              { data: mintSim.revertData },
+            );
+          }
+          const revertMsg =
+            `Mint contract simulation reverted before broadcast` +
+            (mintSim.revertReason ? `: ${mintSim.revertReason}` : '') +
+            (mintSim.revertData ? ` (data: ${mintSim.revertData.slice(0, 18)})` : '') +
+            `. Check wallet eligibility, mint quota, or contract parameters.`;
+          await logExecution(userId, walletAddress, 'FAILED', 0n, 0n, 0n, txHashes, agentId, revertMsg);
+          return { ok: false, reason: `⛔ ${revertMsg}`, partialTxHashes: txHashes };
+        }
+
+        // Omit hardcoded gasLimit so baw backend estimates; auto-retries with buffered gasLimit on 351805
         const result = await executeContractCall({
           userId,
+          step:             'mint',
           walletAddress,
-          to:        ADDR.MINT_CONTRACT,
+          to:               ADDR.MINT_CONTRACT,
           inputData,
           value,
-          gasLimit:  300_000,
+          rpcEstimatedGas:  mintSim.estimatedGas,
+          fallbackGasLimit: 1_200_000,
         });
 
         mintTxHash = result.txHash;
@@ -240,9 +282,18 @@ export async function runFullExecution(
     await onStatus(`✅ Mint confirmed — ${ethers.formatUnits(tokensReceived, 18)} AI tokens received.\n🔐 Approving AI → PancakeSwap Router…`);
 
     const approveData   = buildApproveCalldata(tokensReceived);
+    const approveSim    = await simulateContractCall({
+      step: 'approve', from: walletAddress, to: ADDR.AI_TOKEN, data: approveData, value: 0n,
+    });
     const approveResult = await executeContractCall({
-      userId, walletAddress,
-      to: ADDR.AI_TOKEN, inputData: approveData, value: 0n, gasLimit: 100_000,
+      userId,
+      step: 'approve',
+      walletAddress,
+      to: ADDR.AI_TOKEN,
+      inputData: approveData,
+      value: 0n,
+      rpcEstimatedGas: approveSim.estimatedGas,
+      fallbackGasLimit: 200_000,
     }).catch((e: Error & { isSessionExpired?: boolean }) => {
       if (e.isSessionExpired) throw Object.assign(e, { step: 'approve' });
       throw e;
@@ -260,9 +311,18 @@ export async function runFullExecution(
 
     const bnbBefore  = await readBnbBalance(walletAddress);
     const sellData   = buildSellCalldata(tokensReceived, walletAddress);
+    const sellSim    = await simulateContractCall({
+      step: 'sell', from: walletAddress, to: ADDR.PANCAKE_ROUTER, data: sellData, value: 0n,
+    });
     const sellResult = await executeContractCall({
-      userId, walletAddress,
-      to: ADDR.PANCAKE_ROUTER, inputData: sellData, value: 0n, gasLimit: 300_000,
+      userId,
+      step: 'sell',
+      walletAddress,
+      to: ADDR.PANCAKE_ROUTER,
+      inputData: sellData,
+      value: 0n,
+      rpcEstimatedGas: sellSim.estimatedGas,
+      fallbackGasLimit: 800_000,
     }).catch((e: Error & { isSessionExpired?: boolean }) => {
       if (e.isSessionExpired) throw Object.assign(e, { step: 'sell' });
       throw e;
