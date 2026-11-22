@@ -193,8 +193,8 @@ export interface PreflightResult {
 }
 
 /** Minimum BNB recommended (~0.08 BNB covers mint cost + gas buffer) */
-const GAS_BUFFER = ethers.parseEther('0.01');
-const MIN_BNB    = ethers.parseEther('0.08');
+export const GAS_BUFFER = ethers.parseEther('0.01');
+export const MIN_BNB    = ethers.parseEther('0.08');
 
 export async function runPreflightChecks(
   walletAddress: string,
@@ -456,6 +456,13 @@ export function isMintRaceError(err: unknown): boolean {
     e?.message?.includes('5fb01790') ||
     e?.message?.toLowerCase().includes('expectedstart')
   );
+}
+
+/** Checks if a mint failure was caused by a live price increase between read & submission */
+export function isMintPriceMismatchError(err: unknown): boolean {
+  const e = err as { message?: string } | null;
+  const msg = (e?.message ?? '').toLowerCase();
+  return /maxcost|insufficient.*(value|payment|eth|bnb)|price.*(changed|increased|exceeded)|underpriced.*mint/i.test(msg);
 }
 
 export interface RpcSimulationResult {

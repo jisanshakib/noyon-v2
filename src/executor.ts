@@ -24,7 +24,7 @@ import {
   readCostOf, readBnbBalance, readAiBalance,
   runPreflightChecks, simulateSellOutput, simulateContractCall, isValidAiAgentId,
   buildMintCalldata, buildApproveCalldata, buildSellCalldata,
-  isMintRaceError, ADDR,
+  isMintRaceError, isMintPriceMismatchError, GAS_BUFFER, ADDR,
 } from './bsc.js';
 import {
   isSessionConnectedDb, executeContractCall, getSession, fetchBawAgentId, getBawWalletSettings, syncAgentId,
@@ -152,22 +152,31 @@ export async function runFullExecution(
       return { ok: false, reason: cancelReason };
     }
 
-    // ── 4. MINT (with race retry) ─────────────────────────────────────────────
+    // ── 4. MINT (live price + dynamic gas + race/price retry) ────────────────
     let mintTxHash = '';
     let tokensReceived = 0n;
-    let actualMintCost = mintCostWei;
+    let actualMintCost = 0n;
     let mintAttempt = 0;
 
     while (mintAttempt < MAX_MINT_RETRIES) {
       mintAttempt++;
-      await onStatus(
-        `🔄 Minting (attempt ${mintAttempt}/${MAX_MINT_RETRIES})…\n` +
-        `Mint cost: ${ethers.formatEther(actualMintCost)} BNB`,
-      );
 
       try {
-        const { inputData, value, maxCost, expectedStart } = await buildMintCalldata(10n);
+        // Always resolve the LIVE on-chain mint price & totalMinted right before each attempt
+        // (never reuse stale preflight or previous-attempt cost as share prices rise over time).
+        const [{ inputData, value, maxCost, expectedStart }, liveBnbBal] = await Promise.all([
+          buildMintCalldata(10n),
+          readBnbBalance(walletAddress),
+        ]);
         actualMintCost = maxCost;
+
+        const liveCostBnb = ethers.formatEther(maxCost);
+        const neededBnb   = maxCost + GAS_BUFFER;
+
+        await onStatus(
+          `🔄 Minting (attempt ${mintAttempt}/${MAX_MINT_RETRIES})…\n` +
+          `Live mint cost: ${liveCostBnb} BNB`,
+        );
 
         logger.info(
           {
@@ -176,14 +185,26 @@ export async function runFullExecution(
             to: ADDR.MINT_CONTRACT,
             shares: '10',
             referrer: ADDR.REFERRER,
-            maxCostBnb: ethers.formatEther(maxCost),
+            preflightCostBnb: ethers.formatEther(mintCostWei),
+            liveMintCostBnb: liveCostBnb,
+            priceMovedSincePreflight: maxCost !== mintCostWei,
+            liveBnbBalance: ethers.formatEther(liveBnbBal),
             expectedStart: expectedStart.toString(),
           },
-          'Prepared mint calldata',
+          'Prepared live mint calldata',
         );
 
-        // Read-only BSC RPC simulation: detects contract reverts (including 0x5fb01790 race)
-        // and captures estimatedGas before submitting to baw.
+        // Re-check balance against the fresh live mint cost right before executing
+        if (liveBnbBal < neededBnb) {
+          const balReason =
+            `Insufficient BNB for live mint price. Need ≥ ${ethers.formatEther(neededBnb)} BNB ` +
+            `(live mint cost ${liveCostBnb} BNB + gas buffer), have ${ethers.formatEther(liveBnbBal)} BNB.`;
+          await logExecution(userId, walletAddress, 'STOPPED', 0n, 0n, 0n, txHashes, agentId, balReason);
+          return { ok: false, reason: `⛔ ${balReason}`, partialTxHashes: txHashes };
+        }
+
+        // Read-only BSC RPC simulation: estimates dynamic gas and catches contract reverts
+        // (including 0x5fb01790 expectedStart race or live price increase) before broadcast.
         const mintSim = await simulateContractCall({
           step:  'mint',
           from:  walletAddress,
@@ -193,9 +214,10 @@ export async function runFullExecution(
         });
 
         if (!mintSim.ok && mintSim.isRevert) {
-          if (isMintRaceError({ data: mintSim.revertData, message: mintSim.revertReason ?? mintSim.error })) {
+          const simErr = { data: mintSim.revertData, message: mintSim.revertReason ?? mintSim.error };
+          if (isMintRaceError(simErr) || isMintPriceMismatchError(simErr)) {
             throw Object.assign(
-              new Error(`Mint race detected during RPC simulation (${mintSim.revertReason ?? '0x5fb01790'})`),
+              new Error(`Mint state changed during RPC simulation (${mintSim.revertReason ?? '0x5fb01790'})`),
               { data: mintSim.revertData },
             );
           }
@@ -208,7 +230,8 @@ export async function runFullExecution(
           return { ok: false, reason: `⛔ ${revertMsg}`, partialTxHashes: txHashes };
         }
 
-        // Omit hardcoded gasLimit so baw backend estimates; auto-retries with buffered gasLimit on 351805
+        // Dynamic gasLimit = estimateGas * 1.4 (or 900k fallback ceiling if RPC estimate unavailable),
+        // with automatic single retry at a higher buffer if baw preview returns 351805.
         const result = await executeContractCall({
           userId,
           step:             'mint',
@@ -217,7 +240,7 @@ export async function runFullExecution(
           inputData,
           value,
           rpcEstimatedGas:  mintSim.estimatedGas,
-          fallbackGasLimit: 1_200_000,
+          fallbackGasLimit: 900_000,
         });
 
         mintTxHash = result.txHash;
@@ -228,7 +251,16 @@ export async function runFullExecution(
         // baw execute blocks until confirmed; now read balance
         tokensReceived = await readAiBalance(walletAddress);
 
-        logger.info({ userId, mintTxHash, tokensReceived: tokensReceived.toString() }, 'Mint confirmed');
+        logger.info(
+          {
+            userId,
+            mintTxHash,
+            liveMintCostBnb: liveCostBnb,
+            appliedGasLimit: result.appliedGasLimit,
+            tokensReceived: tokensReceived.toString(),
+          },
+          'Mint confirmed',
+        );
         break; // success
 
       } catch (err) {
@@ -240,13 +272,16 @@ export async function runFullExecution(
             reason: expReason,
             partialTxHashes: txHashes };
         }
-        if (isMintRaceError(err)) {
-          logger.warn({ userId, attempt: mintAttempt }, 'Mint race (expectedStart mismatch) — retrying');
+        if (isMintRaceError(err) || isMintPriceMismatchError(err)) {
+          logger.warn(
+            { userId, attempt: mintAttempt, err: e.message.slice(0, 200) },
+            'Mint race / live price change detected — refreshing live cost & totalMinted',
+          );
           if (mintAttempt < MAX_MINT_RETRIES) {
-            await onStatus(`⚡ Mint race detected — retrying (${mintAttempt}/${MAX_MINT_RETRIES})…`);
+            await onStatus(`⚡ Mint price/state moved — refreshing live cost & retrying (${mintAttempt}/${MAX_MINT_RETRIES})…`);
             continue;
           }
-          const raceReason = `Mint failed after ${MAX_MINT_RETRIES} attempts due to chain congestion. Please try again.`;
+          const raceReason = `Mint failed after ${MAX_MINT_RETRIES} attempts due to chain congestion or price movement. Please try again.`;
           await logExecution(userId, walletAddress, 'FAILED', 0n, 0n, 0n, txHashes, agentId, raceReason);
           return { ok: false, reason: raceReason, partialTxHashes: txHashes };
         }
@@ -293,7 +328,7 @@ export async function runFullExecution(
       inputData: approveData,
       value: 0n,
       rpcEstimatedGas: approveSim.estimatedGas,
-      fallbackGasLimit: 200_000,
+      fallbackGasLimit: 180_000,
     }).catch((e: Error & { isSessionExpired?: boolean }) => {
       if (e.isSessionExpired) throw Object.assign(e, { step: 'approve' });
       throw e;
@@ -322,7 +357,7 @@ export async function runFullExecution(
       inputData: sellData,
       value: 0n,
       rpcEstimatedGas: sellSim.estimatedGas,
-      fallbackGasLimit: 800_000,
+      fallbackGasLimit: 650_000,
     }).catch((e: Error & { isSessionExpired?: boolean }) => {
       if (e.isSessionExpired) throw Object.assign(e, { step: 'sell' });
       throw e;
