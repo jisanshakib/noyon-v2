@@ -79,7 +79,7 @@ Copy `.env.example` to `.env` locally, or configure these variables in your host
 | Name | Address |
 |---|---|
 | SPACE ID AI Mint | `0xa4bFa31f615F8e2a13dce3d93C0996CC5a56763D` |
-| AI Token (ERC-20) | `0x2a60AaB19b182B5C4b47fffC066ADA06Ab27924F` |
+| AI Token (ERC-20) | `0x2a60AaB19b182B5C4b47fffC066ADA06Ab27924f` |
 | PancakeSwap V2 Router | `0x10ED43C718714eb63d5aA57B78B54704E256024E` |
 | WBNB | `0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c` |
 | Referrer (hardcoded) | `0x85377229b28515432cCF1e1c4999BB71C9AdBE11` (`noyonislam.ai`) |
