@@ -33,9 +33,53 @@ function buildPoolConfig(connectionString: string): PoolConfig {
 export const pool = new Pool(buildPoolConfig(config.SUPABASE_DB_URL));
 
 let dbReady = false;
+let botPausedCache = false;
 
 export function isDbAvailable(): boolean {
   return dbReady;
+}
+
+/** Returns whether the admin has stopped the bot for normal users (admin retains full access). */
+export function isBotPaused(): boolean {
+  return botPausedCache;
+}
+
+/** Reloads persisted `bot_paused` state from PostgreSQL/Supabase. */
+export async function loadBotPausedState(): Promise<boolean> {
+  try {
+    const { rows } = await pool.query<{ value: string }>(
+      `SELECT value FROM bot_settings WHERE key = 'bot_paused' LIMIT 1`,
+    );
+    dbReady = true;
+    botPausedCache = rows[0]?.value === 'true';
+    return botPausedCache;
+  } catch (err) {
+    logger.warn({ err }, 'loadBotPausedState failed — using in-memory botPausedCache');
+    return botPausedCache;
+  }
+}
+
+/** Persists admin bot stop/start state to `bot_settings` and updates in-memory cache immediately. */
+export async function setBotPaused(
+  paused: boolean,
+): Promise<{ paused: boolean; persisted: boolean }> {
+  botPausedCache = paused;
+  try {
+    await pool.query(
+      `INSERT INTO bot_settings (key, value, updated_at)
+       VALUES ('bot_paused', $1, now())
+       ON CONFLICT (key) DO UPDATE
+         SET value = EXCLUDED.value,
+             updated_at = now()`,
+      [paused ? 'true' : 'false'],
+    );
+    dbReady = true;
+    logger.info({ botPaused: paused }, 'Updated bot_paused state in database');
+    return { paused, persisted: true };
+  } catch (err) {
+    logger.warn({ err, botPaused: paused }, 'setBotPaused: DB write failed (applied in memory)');
+    return { paused, persisted: false };
+  }
 }
 
 pool.on('error', (err) => {
@@ -90,8 +134,23 @@ export async function initDb(): Promise<void> {
     await client.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS agent_id_name TEXT`);
     await client.query(`ALTER TABLE executions ADD COLUMN IF NOT EXISTS wallet_address TEXT`);
 
+    // Durable key-value settings (e.g. admin-only bot_paused flag)
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS bot_settings (
+        key        TEXT PRIMARY KEY,
+        value      TEXT NOT NULL,
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+      );
+    `);
+
+    // Load persisted bot_paused state so admin stop/start survives restarts
+    const pauseRes = await client.query<{ value: string }>(
+      `SELECT value FROM bot_settings WHERE key = 'bot_paused' LIMIT 1`,
+    );
+    botPausedCache = pauseRes.rows[0]?.value === 'true';
+
     dbReady = true;
-    logger.info('Database schema ready');
+    logger.info({ botPaused: botPausedCache }, 'Database schema ready');
   } catch (err) {
     dbReady = false;
     throw err;

@@ -142,6 +142,8 @@ If the database is temporarily unreachable at startup, the bot starts in **degra
 | `/admin_completed` | Total count and full list of all Agent IDs (`*.ai` / wallet records) and users who completed the full `mint + approve + sell` cycle |
 | `/admin_incomplete` | Count and list of Agent IDs / wallets that only connected (`is_wallet_connected`) OR did not complete the cycle (pending, stopped, failed, session expired, cancelled) with last reason |
 | `/admin_users` | All registered users with connection status, bound Agent ID, completed count, incomplete count, and join date |
+| `/admin_stop` or `/stop_bot` | Stop the bot for all normal users (persisted in `bot_settings`; admin retains full access) |
+| `/admin_start` or `/start_bot` | Turn the bot back ON for all users |
 
 Non-admin users attempting any admin command or callback immediately receive `⛔ Unauthorized.` with zero data exposed.
 

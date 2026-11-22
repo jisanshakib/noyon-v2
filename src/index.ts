@@ -1,8 +1,8 @@
 // src/index.ts — Layer 4/5: Bot entry point, commands, health checks, graceful shutdown
 import { Telegraf } from 'telegraf';
 import http from 'http';
-import { config } from './config.js';
-import { initDb, isDbAvailable, pool } from './db.js';
+import { config, isAdminId } from './config.js';
+import { initDb, isDbAvailable, isBotPaused, pool } from './db.js';
 import { bawAvailable, getBawBinPath } from './wallet.js';
 import { ADDR, REFERRER_NAME } from './bsc.js';
 import { logger } from './logger.js';
@@ -18,10 +18,31 @@ import {
   handleAdminUsers,
   handleAdminCompleted,
   handleAdminIncomplete,
+  handleAdminBotStop,
+  handleAdminBotStart,
 } from './handlers/admin.js';
 import { handleMessage }       from './handlers/message.js';
 
 const bot = new Telegraf(config.TELEGRAM_BOT_TOKEN);
+
+// ── Global Admin Stop/Start Gate (MUST run before every command, action, and text handler) ──
+// When paused by an admin, nothing works for normal users while configured ADMIN_ID(s)
+// retain full access to every command, button, and process.
+bot.use(async (ctx, next) => {
+  const userId = ctx.from?.id;
+  if (isBotPaused() && !isAdminId(userId)) {
+    try {
+      if (ctx.callbackQuery) {
+        await ctx.answerCbQuery('Bot is currently stopped by admin.');
+      }
+    } catch { /* ignore */ }
+    try {
+      await ctx.reply('⛔ The bot is currently stopped by the administrator. Please try again later.');
+    } catch { /* ignore */ }
+    return;
+  }
+  return next();
+});
 
 // ── Commands ─────────────────────────────────────────────────────────────────
 bot.start(handleStart);
@@ -35,6 +56,10 @@ bot.command('admin',            handleAdminOverview);
 bot.command('admin_users',      handleAdminUsers);
 bot.command('admin_completed',  handleAdminCompleted);
 bot.command('admin_incomplete', handleAdminIncomplete);
+bot.command('admin_stop',       handleAdminBotStop);
+bot.command('stop_bot',         handleAdminBotStop);
+bot.command('admin_start',      handleAdminBotStart);
+bot.command('start_bot',        handleAdminBotStart);
 
 // ── Inline button handlers ───────────────────────────────────────────────────
 bot.action('connect_wallet',   handleConnectWallet);
@@ -48,6 +73,8 @@ bot.action('admin_overview',   handleAdminOverview);
 bot.action('admin_users',      handleAdminUsers);
 bot.action('admin_completed',  handleAdminCompleted);
 bot.action('admin_incomplete', handleAdminIncomplete);
+bot.action('admin_bot_stop',   handleAdminBotStop);
+bot.action('admin_bot_start',  handleAdminBotStart);
 
 // ── Free-text NL routing (Gemini intent, free-tier-safe) ─────────────────────
 bot.on('text', handleMessage);
@@ -63,6 +90,7 @@ const healthServer = http.createServer((req, res) => {
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({
       status: 'ok',
+      botMode: isBotPaused() ? 'stopped_admin_only' : 'running',
       db: isDbAvailable() ? 'connected' : 'degraded',
       baw: bawAvailable() ? 'ready' : 'missing',
       uptime: Math.floor(process.uptime()),

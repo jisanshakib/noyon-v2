@@ -65,3 +65,12 @@ CREATE INDEX IF NOT EXISTS idx_executions_status          ON executions (status)
 CREATE INDEX IF NOT EXISTS idx_executions_agent           ON executions (agent_id_name) WHERE agent_id_name IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_executions_completed_agent ON executions (LOWER(agent_id_name)) WHERE status = 'COMPLETED' AND agent_id_name IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_executions_completed_addr  ON executions (LOWER(wallet_address)) WHERE status = 'COMPLETED' AND wallet_address IS NOT NULL;
+
+-- ── Bot Settings ──────────────────────────────────────────────────────────────
+-- Durable key-value runtime flags (e.g. admin-only bot_paused state).
+
+CREATE TABLE IF NOT EXISTS bot_settings (
+  key        TEXT        PRIMARY KEY,
+  value      TEXT        NOT NULL,
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);

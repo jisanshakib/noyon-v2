@@ -47,8 +47,10 @@ import {
   getLatestUnfinishedMint,
   hasCompletedCycleForAgent,
   recordCompletedAgentInMemory,
+  isBotPaused,
   pool,
 } from './db.js';
+import { isAdminId } from './config.js';
 import { logger } from './logger.js';
 
 // ─── Constants ────────────────────────────────────────────────────────────────
@@ -114,6 +116,18 @@ export function isUserLocked(userId: number): boolean { return activeLocks.has(u
 export function requestCancelExecution(userId: number): void { cancelFlags.set(userId, true); }
 function isCancelled(userId: number): boolean { return cancelFlags.get(userId) === true; }
 
+/** Cancels all active background executions owned by non-admin users when admin stops the bot. */
+export function cancelAllNonAdminExecutions(): number {
+  let cancelledCount = 0;
+  for (const uid of activeLocks) {
+    if (!isAdminId(uid)) {
+      cancelFlags.set(uid, true);
+      cancelledCount++;
+    }
+  }
+  return cancelledCount;
+}
+
 // ─── Result types ─────────────────────────────────────────────────────────────
 
 export interface ExecutionSuccess {
@@ -149,6 +163,9 @@ export async function runFullExecution(
   userId: number,
   onStatus: StatusUpdater,
 ): Promise<ExecutionResult> {
+  if (isBotPaused() && !isAdminId(userId)) {
+    return { ok: false, reason: '⛔ The bot is currently stopped by the administrator. Please try again later.' };
+  }
 
   if (activeLocks.has(userId)) {
     return { ok: false, reason: 'A job is already running for your account. Please wait.' };

@@ -8,7 +8,10 @@ import {
   getAllStartedUsers,
   getCompletedUsers,
   getIncompleteUsers,
+  isBotPaused,
+  setBotPaused,
 } from '../db.js';
+import { cancelAllNonAdminExecutions } from '../executor.js';
 import { isAdminId } from '../config.js';
 import { KB } from '../keyboards.js';
 import { logger } from '../logger.js';
@@ -104,8 +107,13 @@ export async function handleAdminOverview(ctx: Context): Promise<void> {
           ]
         : ['🤖 Completed Agent IDs: none yet'];
 
+    const botStatusLine = isBotPaused()
+      ? '🔴 STOPPED (Admin-Only Mode — normal users blocked)'
+      : '🟢 RUNNING (Active for all users)';
+
     const lines = [
       `🛡️ Admin Dashboard Overview`,
+      `Status: ${botStatusLine}`,
       ``,
       `👥 Users:`,
       `  • Total started: ${stats.totalUsers}`,
@@ -125,7 +133,7 @@ export async function handleAdminOverview(ctx: Context): Promise<void> {
       ``,
       ...agentSection,
       ``,
-      `Commands: /admin | /admin_completed | /admin_incomplete | /admin_users`,
+      `Commands: /admin | /admin_completed | /admin_incomplete | /admin_users | /admin_stop | /admin_start`,
     ];
 
     await replyChunked(ctx, lines.join('\n'), true);
@@ -283,4 +291,38 @@ export async function handleAdminUsers(ctx: Context): Promise<void> {
   } catch (err) {
     await replyDbDegraded(ctx, 'admin_users', err);
   }
+}
+
+/** /admin_stop (and /stop_bot) — pauses bot for all normal users; admin retains full access */
+export async function handleAdminBotStop(ctx: Context): Promise<void> {
+  if (!(await guardAdmin(ctx))) return;
+  await safeAnswerCb(ctx, 'Stopping bot for users…');
+
+  const { persisted } = await setBotPaused(true);
+  const cancelledActive = cancelAllNonAdminExecutions();
+
+  await ctx.reply(
+    `🔴 Bot STOPPED for all normal users.\n\n` +
+    `• Normal users: all commands, buttons, and processes are now blocked.\n` +
+    `• Admin access: still fully active for configured ADMIN_ID(s).\n` +
+    (cancelledActive > 0 ? `• Active non-admin jobs cancelled: ${cancelledActive}\n` : '') +
+    `• Persistence: ${persisted ? 'Saved to database (survives restarts)' : 'Active in memory (DB degraded)'}\n\n` +
+    `Use /admin_start or tap "▶️ Start Bot (Users)" to re-enable the bot for everyone.`,
+    KB.adminMenu,
+  );
+}
+
+/** /admin_start (and /start_bot) — re-enables the bot for all users */
+export async function handleAdminBotStart(ctx: Context): Promise<void> {
+  if (!(await guardAdmin(ctx))) return;
+  await safeAnswerCb(ctx, 'Starting bot for users…');
+
+  const { persisted } = await setBotPaused(false);
+
+  await ctx.reply(
+    `🟢 Bot STARTED and active for everyone.\n\n` +
+    `• Normal users: all commands, buttons, and processes are enabled again.\n` +
+    `• Persistence: ${persisted ? 'Saved to database (survives restarts)' : 'Active in memory (DB degraded)'}`,
+    KB.adminMenu,
+  );
 }

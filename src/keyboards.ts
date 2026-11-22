@@ -31,6 +31,10 @@ export const KB = {
       Markup.button.callback('👥 All Users', 'admin_users'),
       Markup.button.callback('🔄 Refresh Overview', 'admin_overview'),
     ],
+    [
+      Markup.button.callback('⏸️ Stop Bot (Users)', 'admin_bot_stop'),
+      Markup.button.callback('▶️ Start Bot (Users)', 'admin_bot_start'),
+    ],
   ]),
 
   /** Shown after wallet connection link is generated */
