@@ -8,7 +8,7 @@ import { initDb, pool } from './db.js';
 import { logger } from './logger.js';
 
 import { handleStart } from './handlers/start.js';
-import { handleConnectWallet } from './handlers/wallet.js';
+import { handleConnectWallet, handleWalletConnected } from './handlers/wallet.js';
 import { handleGenerateQr } from './handlers/qr.js';
 import { handleCompleteProcess } from './handlers/execute.js';
 import { handleMyJobs } from './handlers/jobs.js';
@@ -23,6 +23,7 @@ const bot = new Telegraf(config.TELEGRAM_BOT_TOKEN);
 // ─── Commands ────────────────────────────────────────────────────────────────
 
 bot.start(handleStart);
+bot.command('wallet_connected', handleWalletConnected);
 bot.command('admin_users', handleAdminUsers);
 bot.command('admin_completed', handleAdminCompleted);
 

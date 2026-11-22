@@ -2,13 +2,12 @@
 // "Generate QR Code" callback handler.
 
 import { Context } from 'telegraf';
-import { getSession, generatePairingUri } from '../wallet.js';
+import { getSession, getSessionLinkFromDb } from '../wallet.js';
 import { updateUser } from '../db.js';
 import { generateQrBuffer } from '../qr.js';
 import { KB } from '../keyboards.js';
 import { logger } from '../logger.js';
 
-// FIX #11: answerCbQuery guard — safe when reached via text message routing.
 async function safeAnswerCb(ctx: Context, text?: string): Promise<void> {
   try {
     if (ctx.callbackQuery) await ctx.answerCbQuery(text);
@@ -24,14 +23,34 @@ export async function handleGenerateQr(ctx: Context): Promise<void> {
   await safeAnswerCb(ctx, 'Generating QR code…');
 
   try {
-    // Ensure there is a pairing URI (generate one if none exists)
-    let session = getSession(userId);
-    if (!session) {
-      session = await generatePairingUri(userId);
-      await updateUser(userId, { session_link: session.pairingUri });
+    // FIX: Never silently auto-generate a new pairing URI in the QR handler.
+    // The QR code MUST encode the same URI the user was shown in "Connect Wallet".
+    // Resolution order:
+    //   1. In-memory session cache (fastest, same process lifetime)
+    //   2. Supabase session_link (survives bot restarts)
+    //   3. No link found → instruct user to click "Connect Your Binance Wallet" first
+
+    let pairingUri: string | null = null;
+
+    const memSession = getSession(userId);
+    if (memSession?.pairingUri) {
+      pairingUri = memSession.pairingUri;
+    } else {
+      // Fallback: read from Supabase (bot may have restarted)
+      pairingUri = await getSessionLinkFromDb(userId);
     }
 
-    const qrBuffer = await generateQrBuffer(session.pairingUri);
+    if (!pairingUri) {
+      await ctx.reply(
+        '⚠️ No pairing link found.\n\n' +
+        'Please tap Connect Your Binance Wallet first to generate a pairing link, ' +
+        'then come back here to generate the QR code.',
+        KB.start,
+      );
+      return;
+    }
+
+    const qrBuffer = await generateQrBuffer(pairingUri);
     await updateUser(userId, { qr_generated: true, current_step: 'qr_shown' });
 
     await ctx.replyWithPhoto(
@@ -39,8 +58,9 @@ export async function handleGenerateQr(ctx: Context): Promise<void> {
       {
         caption:
           '📱 Scan this QR code with your Binance app to connect your wallet.\n\n' +
-          'After connecting, tap Complete All Process to start.',
-        // FIX #9: plain text caption — avoids MarkdownV2 parse failure
+          'After connecting in the Binance app, send:\n' +
+          '  /wallet_connected 0xYourAddress YourAgent.ai\n\n' +
+          'Then tap Complete All Process to start.',
         ...KB.afterQr,
       },
     );

@@ -15,17 +15,24 @@ CREATE TABLE IF NOT EXISTS users (
   started_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
   last_active_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
   current_step        TEXT        NOT NULL DEFAULT 'start',
-  -- current_step values: start | connecting | qr_shown | executing | completed | failed | cancelled
-  session_link        TEXT,       -- WalletConnect pairing URI
+  -- current_step values:
+  --   start | connecting | qr_shown | connected | executing | completed | failed | cancelled
+  session_link        TEXT,       -- Real pairing deep-link URI (from Binance SDK / BINANCE_WALLET_PAIRING_BASE_URL)
   qr_generated        BOOLEAN     NOT NULL DEFAULT FALSE,
-  is_wallet_connected BOOLEAN     NOT NULL DEFAULT FALSE,
+  is_wallet_connected BOOLEAN     NOT NULL DEFAULT FALSE,  -- TRUE only after markSessionConnected() succeeds
   is_cancelled        BOOLEAN     NOT NULL DEFAULT FALSE,
   completed_count     INT         NOT NULL DEFAULT 0
 );
 
+-- Migration: add columns if schema was created before this version
+-- (safe to run multiple times — IF NOT EXISTS / DO NOTHING patterns)
+ALTER TABLE users ADD COLUMN IF NOT EXISTS session_link TEXT;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS qr_generated BOOLEAN NOT NULL DEFAULT FALSE;
+
 -- Index for admin "last active" queries
 CREATE INDEX IF NOT EXISTS idx_users_last_active ON users (last_active_at DESC);
 CREATE INDEX IF NOT EXISTS idx_users_completed   ON users (completed_count DESC) WHERE completed_count > 0;
+CREATE INDEX IF NOT EXISTS idx_users_connected   ON users (is_wallet_connected) WHERE is_wallet_connected = TRUE;
 
 -- ── Executions ────────────────────────────────────────────────────────────────
 -- One row per mint/approve/sell pipeline run (all statuses).

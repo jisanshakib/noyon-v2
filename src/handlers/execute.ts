@@ -2,7 +2,7 @@
 // "Complete All Process" callback handler — runs the mint/approve/sell pipeline.
 
 import { Context } from 'telegraf';
-import { isSessionConnected } from '../wallet.js';
+import { isSessionConnectedDb } from '../wallet.js';
 import { isUserLocked, requestCancelExecution, runFullExecution } from '../executor.js';
 import { getUser, updateUser } from '../db.js';
 import { KB } from '../keyboards.js';
@@ -27,15 +27,22 @@ export async function handleCompleteProcess(ctx: Context): Promise<void> {
 
   await safeAnswerCb(ctx, 'Starting…');
 
-  // Guard: wallet must be connected
-  if (!isSessionConnected(userId)) {
+  // Guard: wallet must be connected — check Supabase (authoritative source of truth).
+  // isSessionConnectedDb() survives bot restarts; the in-memory check would
+  // incorrectly block users whose connection was set before the last restart.
+  const connected = await isSessionConnectedDb(userId);
+  if (!connected) {
     // FIX #9: removed incorrect double-escaping. escMd() is NOT called here because
     // the string literals already contain no special MarkdownV2 chars that need
     // escaping beyond what we explicitly write. Use plain text for safety-critical
     // messages so they always render, even if Telegram MarkdownV2 parsing tightens.
     await ctx.reply(
       '⚠️ Your Binance Wallet is not connected yet.\n\n' +
-      'Please tap Connect Your Binance Wallet first, then scan the QR code in your Binance app.',
+      'Steps to connect:\n' +
+      '  1. Tap Connect Your Binance Wallet to get a pairing link.\n' +
+      '  2. Scan the QR code with your Binance app.\n' +
+      '  3. After pairing, send /wallet_connected 0xYourAddress YourAgent.ai\n' +
+      '  4. Then tap Complete All Process.',
       KB.start,
     );
     return;

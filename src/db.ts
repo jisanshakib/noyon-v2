@@ -48,6 +48,10 @@ export async function initDb(): Promise<void> {
       );
     `);
 
+    // Safe migrations — add columns that may not exist on older deployments
+    await client.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS session_link TEXT`);
+    await client.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS qr_generated BOOLEAN NOT NULL DEFAULT FALSE`);
+
     logger.info('Database schema ready');
   } finally {
     client.release();
