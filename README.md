@@ -131,7 +131,7 @@ If the database is temporarily unreachable at startup, the bot starts in **degra
 | `/start` | Welcome message with hardcoded referrer (`noyonislam.ai` / `0x85377229...`) and main menu |
 | `/connect` or `🔗 Connect Your Binance Wallet` | Start real `baw auth signin` pairing flow, send scannable QR, and bind session automatically |
 | `📱 Generate QR Code` | Re-render QR strictly from the user's stored pairing session URI |
-| `/mint` or `🚀 Complete All Process` | Run deterministic preflight → mint (5x race retry) → 8% stop-loss check → exact approve → sell |
+| `/mint` or `🚀 Complete All Process` | Run deterministic preflight → live-price mint → exact approve → instant market-price sell (with continuous retry until confirmed) |
 | `/status`, `/my_jobs`, or `📊 My Status & Jobs` | View **only your own** wallet connection, bound `.ai` Agent ID, completed cycle count/history, and incomplete/failed/stopped attempt counts |
 | `❌ Cancel` | Request stop at next safe checkpoint and reset/sign out session |
 
@@ -163,7 +163,7 @@ Upload only the clean source files (never `node_modules/`, `dist/`, or `.env`). 
 - 🔒 Per-user isolated `baw` session directories (`<BAW_SESSION_ROOT>/<userId>/`) and per-user serial execution locks
 - 🔒 Never asks users to send BNB directly to a contract address
 - 🔒 Exact ERC-20 token approval to PancakeSwap V2 Router (no unlimited approvals)
-- 🔒 8% sell-simulation stop-loss protection before approve/sell
+- 🔒 Instant market-price sell on PancakeSwap V2 with dynamic gas buffering and automatic retry until confirmed (stopping on user cancel, expired session, or zero AI balance)
 - 🔒 Hardcoded referrer `0x85377229b28515432cCF1e1c4999BB71C9AdBE11` (`noyonislam.ai`) on every mint
 - 🔒 Admin views strictly gated by numeric `ADMIN_IDS` check
 

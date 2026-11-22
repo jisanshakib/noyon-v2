@@ -500,7 +500,7 @@ export function buildApproveCalldata(amount: bigint): string {
 
 /**
  * Returns swapExactTokensForETHSupportingFeeOnTransferTokens calldata.
- * amountOutMin = 0 — stop-loss check enforced upstream by executor.
+ * amountOutMin = 0 — executes instant market-price sell at current PancakeSwap V2 rate.
  */
 export function buildSellCalldata(aiAmount: bigint, walletAddress: string): string {
   const recipient = normalizeAddress(walletAddress, 'sell.recipient');

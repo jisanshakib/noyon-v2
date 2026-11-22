@@ -119,7 +119,7 @@ export async function handleAdminOverview(ctx: Context): Promise<void> {
       `  • Unique completed Agent IDs: ${stats.uniqueCompletedAgentIds.length}`,
       ``,
       `⚠️ Non-Completed Attempts (${incompleteRunsTotal} total):`,
-      `  • Stopped (preflight / 8% stop-loss): ${stats.stoppedRunsTotal}`,
+      `  • Stopped (preflight / guard): ${stats.stoppedRunsTotal}`,
       `  • Failed (session expired / RPC / congestion): ${stats.failedRunsTotal}`,
       `  • Cancelled: ${stats.cancelledRunsTotal}`,
       ``,

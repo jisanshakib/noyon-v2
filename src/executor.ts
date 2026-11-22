@@ -8,10 +8,15 @@
 //
 // Stop conditions (checked before ANY on-chain write):
 //   - No .ai Agent ID on wallet
-//   - Insufficient BNB (< mintCost + 0.01 BNB gas buffer)
+//   - Insufficient BNB (< mintCost + 0.01 BNB gas buffer; or < 0.005 BNB when resuming sell)
 //   - Developer mode not enabled
 //   - Mint quota exhausted
-//   - Simulated sell < 92% of mint cost (8% stop-loss)
+//
+// Sell behavior:
+//   - Instant sell at current market/contract price (no stop-loss percentage block).
+//   - Reads live AI balance, live allowance, live quote, and dynamic gas right before
+//     each sell attempt and retries continuously until confirmed (stopping only on
+//     user cancel, baw session expiration, or 0 AI balance remaining).
 //
 // Retry logic:
 //   - Once minting starts, retries continuously with short backoff, fresh live
@@ -41,7 +46,6 @@ import { logger } from './logger.js';
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
-const STOP_LOSS_RATIO      = 0.92;  // stop if simulated sell < 92% of mint cost
 const RETRY_BASE_DELAY_MS  = 1_500; // initial backoff on smart contract call failure
 const RETRY_STEP_DELAY_MS  = 500;   // linear backoff increment per attempt
 const RETRY_MAX_DELAY_MS   = 5_000; // backoff cap (keeps retries responsive)
@@ -304,7 +308,7 @@ export async function runFullExecution(
                 { userId, step: 'mint', mintAttempt, tokensReceived: tokensReceived.toString() },
                 'Detected confirmed AI tokens on-chain before retry — skipping redundant mint',
               );
-              await onStatus(`✅ Previous mint confirmed on-chain (${ethers.formatUnits(tokensReceived, 18)} AI).\nProceeding to stop-loss & sell…`);
+              await onStatus(`✅ Previous mint confirmed on-chain (${ethers.formatUnits(tokensReceived, 18)} AI).\nProceeding to Approve → Sell…`);
               break;
             }
           } catch (balErr) {
@@ -489,25 +493,9 @@ export async function runFullExecution(
       return { ok: false, reason: cancelReason, partialTxHashes: txHashes };
     }
 
-    // ── 5. Post-mint 8% stop-loss check ──────────────────────────────────────
-    await onStatus('📊 Simulating sell output (stop-loss check)…');
-    const simulatedSellWei  = await simulateSellOutput(tokensReceived);
-    const mintCostF         = parseFloat(ethers.formatEther(actualMintCost));
-    const simulatedSellF    = parseFloat(ethers.formatEther(simulatedSellWei));
+    const mintCostF = parseFloat(ethers.formatEther(actualMintCost));
 
-    if (simulatedSellWei > 0n && simulatedSellF < mintCostF * STOP_LOSS_RATIO) {
-      const stopReason =
-        `Simulated sell (${simulatedSellF.toFixed(5)} BNB) is more than 8% ` +
-        `below mint cost (${mintCostF.toFixed(5)} BNB). Stopping to protect funds.`;
-      await logExecution(userId, walletAddress, 'STOPPED', actualMintCost, tokensReceived, 0n, txHashes, agentId, stopReason);
-      return {
-        ok: false,
-        reason: `⛔ ${stopReason}\n\nMint TX: ${mintTxHash}`,
-        partialTxHashes: txHashes,
-      };
-    }
-
-    // ── 6. APPROVE (exact amount, retries on smart contract call failure until confirmed) ──
+    // ── 5. APPROVE (exact amount, retries on smart contract call failure until confirmed) ──
     let approveTxHash = unfinishedMint?.tx_hashes?.approve ?? '';
     let approveAttempt = 0;
     let lastApproveEditAt = 0;
@@ -622,46 +610,87 @@ export async function runFullExecution(
       return { ok: false, reason: cancelReason, partialTxHashes: txHashes };
     }
 
-    // ── 7. SELL (retries on smart contract call failure while enforcing 8% stop-loss) ──
+    // ── 6. INSTANT SELL AT CURRENT MARKET PRICE (retries until confirmed) ────
+    // No 8% stop-loss block: sells immediately at whatever live market/contract
+    // quote is available. Keeps retrying on contract/simulation/RPC/baw failures
+    // until confirmed — stopping only on user cancel, session expiration, or 0 AI balance.
     const bnbBefore = await readBnbBalance(walletAddress);
     let sellTxHash = '';
     let sellAttempt = 0;
     let lastSellEditAt = 0;
+    let soldTokensWei = tokensReceived;
 
     while (true) {
       if (isCancelled(userId)) {
         const cancelReason = `Cancelled before/during sell. Mint: ${mintTxHash}, Approve: ${approveTxHash}`;
-        await logExecution(userId, walletAddress, 'CANCELLED', actualMintCost, tokensReceived, 0n, txHashes, agentId, cancelReason);
+        await logExecution(userId, walletAddress, 'CANCELLED', actualMintCost, soldTokensWei, 0n, txHashes, agentId, cancelReason);
         return { ok: false, reason: cancelReason, partialTxHashes: txHashes };
-      }
-
-      // Guard against double-sell if a previous attempt's swap landed on-chain
-      if (sellAttempt > 0) {
-        const remainingAi = await readAiBalance(walletAddress);
-        if (remainingAi === 0n) {
-          if (!sellTxHash) sellTxHash = txHashes.sell ?? 'confirmed-onchain';
-          logger.info({ userId, step: 'sell', sellAttempt }, 'AI balance is 0 before sell retry — previous sell confirmed');
-          break;
-        }
-        // Re-check 8% stop-loss before retrying sell
-        const reSimWei = await simulateSellOutput(remainingAi);
-        const reSimF   = parseFloat(ethers.formatEther(reSimWei));
-        if (reSimWei > 0n && reSimF < mintCostF * STOP_LOSS_RATIO) {
-          const stopReason =
-            `Simulated sell (${reSimF.toFixed(5)} BNB) dropped more than 8% ` +
-            `below mint cost (${mintCostF.toFixed(5)} BNB) during retry. Stopping to protect funds.`;
-          await logExecution(userId, walletAddress, 'STOPPED', actualMintCost, remainingAi, 0n, txHashes, agentId, stopReason);
-          return { ok: false, reason: `⛔ ${stopReason}\n\nMint TX: ${mintTxHash}`, partialTxHashes: txHashes };
-        }
       }
 
       sellAttempt++;
       try {
+        // Read live token balance & allowance right before every sell attempt
+        const [liveAiBalance, liveAllowance] = await Promise.all([
+          readAiBalance(walletAddress),
+          readAiAllowance(walletAddress, ADDR.PANCAKE_ROUTER),
+        ]);
+
+        if (liveAiBalance === 0n) {
+          if (sellAttempt > 1 || txHashes.sell) {
+            if (!sellTxHash) sellTxHash = txHashes.sell ?? 'confirmed-onchain';
+            logger.info({ userId, step: 'sell', sellAttempt }, 'AI balance is 0 — previous sell confirmed on-chain');
+            break;
+          }
+          const zeroBalReason = 'No AI token balance remaining in wallet to sell.';
+          await logExecution(userId, walletAddress, 'STOPPED', actualMintCost, 0n, 0n, txHashes, agentId, zeroBalReason);
+          return { ok: false, reason: `⚠️ ${zeroBalReason}`, partialTxHashes: txHashes };
+        }
+
+        soldTokensWei    = liveAiBalance;
+        tokensReceived   = liveAiBalance;
+        trackedTokensWei = liveAiBalance;
+
+        // Ensure live allowance covers the live AI balance before selling
+        if (liveAllowance < liveAiBalance) {
+          logger.info(
+            {
+              userId,
+              step: 'sell_reapprove',
+              attempt: sellAttempt,
+              liveAllowance: liveAllowance.toString(),
+              liveAiBalance: liveAiBalance.toString(),
+            },
+            'Live AI allowance below balance before sell — approving exact live balance',
+          );
+          const reApproveData = buildApproveCalldata(liveAiBalance);
+          const reApproveSim  = await simulateContractCall({
+            step: 'approve', from: walletAddress, to: ADDR.AI_TOKEN, data: reApproveData, value: 0n,
+          });
+          const reApproveRes  = await executeContractCall({
+            userId,
+            step: 'approve',
+            walletAddress,
+            to: ADDR.AI_TOKEN,
+            inputData: reApproveData,
+            value: 0n,
+            rpcEstimatedGas: reApproveSim.estimatedGas,
+            fallbackGasLimit: 180_000,
+          });
+          approveTxHash    = reApproveRes.txHash;
+          txHashes.approve = approveTxHash;
+          await waitForTxConfirmation(approveTxHash, 30_000);
+        }
+
+        // Informational live quote only (never blocks selling regardless of price vs mint cost)
+        const liveQuoteWei = await simulateSellOutput(liveAiBalance);
+        const liveQuoteBnb = liveQuoteWei > 0n ? ethers.formatEther(liveQuoteWei) : 'market';
+
         const now = Date.now();
         if (sellAttempt <= 2 || now - lastSellEditAt >= STATUS_THROTTLE_MS) {
           lastSellEditAt = now;
           await onStatus(
-            `💱 Selling ${ethers.formatUnits(tokensReceived, 18)} AI tokens on PancakeSwap V2` +
+            `💱 Selling ${ethers.formatUnits(liveAiBalance, 18)} AI tokens at current market price` +
+            `${liveQuoteWei > 0n ? ` (~${parseFloat(liveQuoteBnb).toFixed(5)} BNB est.)` : ''}` +
             `${sellAttempt > 1 ? ` (attempt #${sellAttempt})` : ''}…`,
           );
         }
@@ -675,12 +704,13 @@ export async function runFullExecution(
             tokenIn: ADDR.AI_TOKEN,
             tokenOut: ADDR.WBNB,
             recipient: walletAddress,
-            amountIn: tokensReceived.toString(),
+            amountIn: liveAiBalance.toString(),
+            liveQuoteBnb,
           },
-          'Prepared sell calldata with normalized addresses',
+          'Prepared live market sell calldata with normalized addresses',
         );
 
-        const sellData   = buildSellCalldata(tokensReceived, walletAddress);
+        const sellData   = buildSellCalldata(liveAiBalance, walletAddress);
         const sellSim    = await simulateContractCall({
           step: 'sell', from: walletAddress, to: ADDR.PANCAKE_ROUTER, data: sellData, value: 0n,
         });
@@ -703,25 +733,24 @@ export async function runFullExecution(
       } catch (err) {
         const e = err as Error & { isSessionExpired?: boolean };
         if (e.isSessionExpired) throw Object.assign(e, { step: 'sell' });
-        if (isHardStopError(err)) throw err;
 
-        const delayMs = computeRetryDelayMs(sellAttempt);
+        const delayMs  = computeRetryDelayMs(sellAttempt);
         const shortErr = summarizeRetryError(err);
         logger.warn(
           { userId, step: 'sell', attempt: sellAttempt, retryDelayMs: delayMs, err: shortErr },
-          'Sell smart contract call failed — retrying with fresh gas estimate',
+          'Sell attempt failed — retrying with fresh live balance, quote & gas estimate',
         );
         const now = Date.now();
         if (sellAttempt <= 3 || now - lastSellEditAt >= STATUS_THROTTLE_MS) {
           lastSellEditAt = now;
           await onStatus(
-            `🔁 Sell attempt #${sellAttempt} failed — retrying…\n` +
+            `🔁 Sell attempt #${sellAttempt} failed — retrying automatically…\n` +
             `Reason: ${shortErr}\nNext retry in ${(delayMs / 1000).toFixed(1)}s (tap Cancel to stop).`,
           );
         }
         if (await sleepWithCancelCheck(userId, delayMs)) {
           const cancelReason = `Cancelled during sell retries. Mint: ${mintTxHash}, Approve: ${approveTxHash}`;
-          await logExecution(userId, walletAddress, 'CANCELLED', actualMintCost, tokensReceived, 0n, txHashes, agentId, cancelReason);
+          await logExecution(userId, walletAddress, 'CANCELLED', actualMintCost, soldTokensWei, 0n, txHashes, agentId, cancelReason);
           return { ok: false, reason: cancelReason, partialTxHashes: txHashes };
         }
       }
