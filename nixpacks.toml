@@ -1,0 +1,14 @@
+# nixpacks.toml — build/start for Railway and Render (nixpacks builder)
+# Railway auto-detects this. On Render: select "Nixpacks" as the build method.
+
+[phases.install]
+cmds = ["npm ci"]           # installs ALL deps including devDeps (tsc lives there)
+
+[phases.build]
+cmds = ["npm run build"]    # runs: npx tsc  → outputs to dist/
+
+[start]
+cmd = "npm start"           # runs: node dist/index.js
+
+[variables]
+NODE_ENV = "production"
