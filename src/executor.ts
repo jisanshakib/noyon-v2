@@ -21,13 +21,13 @@
 
 import { ethers } from 'ethers';
 import {
-  readCostOf, readBnbBalance, readAiBalance, readSpaceIdName,
-  runPreflightChecks, simulateSellOutput,
+  readCostOf, readBnbBalance, readAiBalance,
+  runPreflightChecks, simulateSellOutput, isValidAiAgentId,
   buildMintCalldata, buildApproveCalldata, buildSellCalldata,
   isMintRaceError, ADDR,
 } from './bsc.js';
 import {
-  isSessionConnectedDb, executeContractCall, getSession, syncAgentId,
+  isSessionConnectedDb, executeContractCall, getSession, fetchBawAgentId, syncAgentId,
 } from './wallet.js';
 import { generateExecutionSummary } from './gemini.js';
 import { insertExecution, pool } from './db.js';
@@ -96,23 +96,28 @@ export async function runFullExecution(
     // ── 1. Verify wallet session (Supabase-authoritative) ─────────────────────
     await onStatus('🔍 Verifying wallet connection…');
 
-    const { connected, address: walletAddress } = await isSessionConnectedDb(userId);
+    const { connected, address: walletAddress, dbAgentId } = await isSessionConnectedDb(userId);
     if (!connected || !walletAddress) {
       return { ok: false, reason: 'Wallet not connected. Tap Connect Wallet and complete pairing first.' };
     }
 
     resolvedWallet = walletAddress;
     const session = getSession(userId);
-    let agentId = session?.agentIdName?.trim() || '';
-    if (!agentId) {
-      const onChainName = (await readSpaceIdName(walletAddress)).trim();
-      if (onChainName) {
-        agentId = onChainName;
-        await syncAgentId(userId, onChainName);
-      }
+    const sessionAgentId = session?.agentIdName?.trim() || '';
+    const persistedAgentId = dbAgentId?.trim() || '';
+
+    // If neither memory session nor DB has a valid *.ai Agent ID, re-query `baw wallet agent-id`
+    let bawAgentId = '';
+    if (!isValidAiAgentId(sessionAgentId) && !isValidAiAgentId(persistedAgentId)) {
+      bawAgentId = (await fetchBawAgentId(userId))?.trim() || '';
     }
-    resolvedAgentId = agentId || walletAddress;
-    agentId = resolvedAgentId;
+
+    let agentId =
+      (isValidAiAgentId(sessionAgentId) ? sessionAgentId : '') ||
+      (isValidAiAgentId(persistedAgentId) ? persistedAgentId : '') ||
+      (isValidAiAgentId(bawAgentId) ? bawAgentId : '') ||
+      walletAddress;
+    resolvedAgentId = agentId;
 
     // ── 2. Read live mint cost ────────────────────────────────────────────────
     await onStatus('📡 Reading live mint cost from chain…');
@@ -120,7 +125,16 @@ export async function runFullExecution(
 
     // ── 3. Preflight stop-condition checks ───────────────────────────────────
     await onStatus('🛡 Running preflight checks…');
-    const preflight = await runPreflightChecks(walletAddress, mintCostWei);
+    const preflight = await runPreflightChecks(walletAddress, mintCostWei, {
+      sessionAgentId: sessionAgentId || null,
+      dbAgentId: persistedAgentId || null,
+      bawAgentId: bawAgentId || null,
+    });
+    if (preflight.resolvedAgentId) {
+      agentId = preflight.resolvedAgentId;
+      resolvedAgentId = agentId;
+      await syncAgentId(userId, agentId);
+    }
     if (!preflight.ok) {
       const reason = preflight.reason ?? 'Preflight check failed.';
       await logExecution(userId, walletAddress, 'STOPPED', 0n, 0n, 0n, txHashes, agentId, reason);

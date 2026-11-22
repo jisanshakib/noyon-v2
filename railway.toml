@@ -1,5 +1,8 @@
 [build]
 builder = "NIXPACKS"
+# Dependencies are installed during Nixpacks' [phases.install] (see nixpacks.toml).
+# Keep buildCommand strictly to compilation so it never runs `npm ci` against the
+# mounted /app/node_modules/.cache directory during the build phase (prevents EBUSY).
 buildCommand = "npm run build"
 
 [deploy]

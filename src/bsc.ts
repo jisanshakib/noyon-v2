@@ -98,8 +98,22 @@ export async function readMintQuota(address: string): Promise<bigint> {
 }
 
 export async function readSpaceIdName(address: string): Promise<string> {
-  try { return String(await mintContract().spaceIdAiName(address)); }
-  catch { return ''; }
+  try {
+    const name = String(await mintContract().spaceIdAiName(address) ?? '').trim();
+    return name;
+  } catch (err) {
+    logger.warn(
+      { walletAddress: address, err: (err as Error)?.message ?? String(err) },
+      'readSpaceIdName on-chain lookup returned error (will allow session/DB/baw fallback)',
+    );
+    return '';
+  }
+}
+
+/** True when the candidate is a non-empty *.ai SPACE ID Agent name (e.g. dadyjisan.ai). */
+export function isValidAiAgentId(name?: string | null): boolean {
+  if (typeof name !== 'string') return false;
+  return /^[^\s]+\.ai$/i.test(name.trim());
 }
 
 // ─── Sell simulation ──────────────────────────────────────────────────────────
@@ -129,7 +143,17 @@ export async function simulateSellOutput(aiAmount: bigint): Promise<bigint> {
 
 // ─── Preflight checks ─────────────────────────────────────────────────────────
 
-export interface PreflightResult { ok: boolean; reason?: string; }
+export interface PreflightContext {
+  sessionAgentId?: string | null;
+  dbAgentId?: string | null;
+  bawAgentId?: string | null;
+}
+
+export interface PreflightResult {
+  ok: boolean;
+  reason?: string;
+  resolvedAgentId?: string;
+}
 
 /** Minimum BNB recommended (~0.08 BNB covers mint cost + gas buffer) */
 const GAS_BUFFER = ethers.parseEther('0.01');
@@ -138,30 +162,101 @@ const MIN_BNB    = ethers.parseEther('0.08');
 export async function runPreflightChecks(
   walletAddress: string,
   mintCostWei: bigint,
+  ctx?: PreflightContext,
 ): Promise<PreflightResult> {
-  const [bnbBal, spaceId, devMode, quota] = await Promise.all([
+  const [bnbBal, onChainSpaceId, devMode, quota] = await Promise.all([
     readBnbBalance(walletAddress),
     readSpaceIdName(walletAddress),
     readDeveloperMode(walletAddress),
     readMintQuota(walletAddress),
   ]);
 
+  const onChainName = onChainSpaceId.trim();
+  const bawName     = ctx?.bawAgentId?.trim() ?? '';
+  const sessionName = ctx?.sessionAgentId?.trim() ?? '';
+  const dbName      = ctx?.dbAgentId?.trim() ?? '';
+
+  // Resolve *.ai Agent ID:
+  // 1. On-chain readSpaceIdName (if valid *.ai)
+  // 2. Live baw wallet agent-id lookup (if valid *.ai)
+  // 3. In-memory bound session agentIdName (if valid *.ai)
+  // 4. Persisted Supabase users.agent_id_name (if valid *.ai)
+  let resolvedAgentId = '';
+  let agentIdSource: 'onchain' | 'baw' | 'session' | 'db' | 'none' = 'none';
+
+  if (isValidAiAgentId(onChainName)) {
+    resolvedAgentId = onChainName;
+    agentIdSource   = 'onchain';
+  } else if (isValidAiAgentId(bawName)) {
+    resolvedAgentId = bawName;
+    agentIdSource   = 'baw';
+  } else if (isValidAiAgentId(sessionName)) {
+    resolvedAgentId = sessionName;
+    agentIdSource   = 'session';
+  } else if (isValidAiAgentId(dbName)) {
+    resolvedAgentId = dbName;
+    agentIdSource   = 'db';
+  }
+
+  logger.info(
+    {
+      walletAddress,
+      onChainSpaceId: onChainName || null,
+      bawAgentId: bawName || null,
+      sessionAgentId: sessionName || null,
+      dbAgentId: dbName || null,
+      resolvedAgentId: resolvedAgentId || null,
+      agentIdSource,
+      bnbBalance: ethers.formatEther(bnbBal),
+      devMode,
+      quota: quota.toString(),
+    },
+    'Preflight Agent ID & chain state check',
+  );
+
+  const boundCandidate = bawName || sessionName || dbName;
+  if (
+    onChainName &&
+    boundCandidate &&
+    onChainName.toLowerCase() !== boundCandidate.toLowerCase()
+  ) {
+    logger.warn(
+      { walletAddress, onChainSpaceId: onChainName, boundAgentId: boundCandidate, resolvedAgentId },
+      'Preflight: on-chain spaceIdAiName differs from bound/session Agent ID',
+    );
+  }
+
   const needed = mintCostWei + GAS_BUFFER;
   if (bnbBal < needed) {
-    return { ok: false, reason:
-      `Insufficient BNB. Need ≥ ${ethers.formatEther(needed)} BNB (have ${ethers.formatEther(bnbBal)} BNB). ` +
-      `Minimum recommended: ${ethers.formatEther(MIN_BNB)} BNB.` };
+    return {
+      ok: false,
+      resolvedAgentId: resolvedAgentId || undefined,
+      reason:
+        `Insufficient BNB. Need ≥ ${ethers.formatEther(needed)} BNB (have ${ethers.formatEther(bnbBal)} BNB). ` +
+        `Minimum recommended: ${ethers.formatEther(MIN_BNB)} BNB.`,
+    };
   }
-  if (!spaceId?.trim()) {
-    return { ok: false, reason: 'No SPACE ID AI name (*.ai) on this wallet. Register one in the SPACE ID AI dashboard first.' };
+  if (!resolvedAgentId) {
+    return {
+      ok: false,
+      reason: 'No SPACE ID AI name (*.ai) on this wallet. Register one in the SPACE ID AI dashboard first.',
+    };
   }
   if (!devMode) {
-    return { ok: false, reason: 'Developer mode is not enabled. Enable it in the SPACE ID AI dashboard.' };
+    return {
+      ok: false,
+      resolvedAgentId,
+      reason: 'Developer mode is not enabled. Enable it in the SPACE ID AI dashboard.',
+    };
   }
   if (quota === 0n) {
-    return { ok: false, reason: 'Mint quota exhausted. Wait for daily quota reset.' };
+    return {
+      ok: false,
+      resolvedAgentId,
+      reason: 'Mint quota exhausted. Wait for daily quota reset.',
+    };
   }
-  return { ok: true };
+  return { ok: true, resolvedAgentId };
 }
 
 // ─── Calldata builders (for baw contract-call) ────────────────────────────────

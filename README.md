@@ -149,10 +149,10 @@ Non-admin users attempting any admin command or callback immediately receive `â›
 
 ## Deployment (Railway / Render / GitHub Drag-and-Drop)
 
-Upload only the clean source files (never `node_modules/`, `dist/`, or `.env`). Both `nixpacks.toml` and `railway.toml` run:
-- **Install:** `npm ci`
-- **Build:** `npm run build`
-- **Start:** `npm start`
+Upload only the clean source files (never `node_modules/`, `dist/`, or `.env`). `nixpacks.toml` and `railway.toml` keep install and build phases cleanly separated (preventing Nixpacks `EBUSY` on `/app/node_modules/.cache`):
+- **Install phase (`nixpacks.toml`):** `npm ci --include=dev`
+- **Build phase (`railway.toml` / `nixpacks.toml`):** `npm run build` (`tsc` â†’ `dist/index.js`)
+- **Start:** `npm start` (`node dist/index.js`)
 - **Health check:** `GET /health`
 
 ---

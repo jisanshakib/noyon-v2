@@ -224,6 +224,35 @@ function unwrap(raw: Record<string, unknown>): Record<string, unknown> {
   return raw;
 }
 
+/** Extracts a claimed *.ai Agent ID from unwrapped baw wallet agent-id output. */
+function extractAgentIdName(agentRaw: Record<string, unknown>): string | undefined {
+  if (agentRaw.claimed === false) return undefined;
+  const candidate = agentRaw.agentId ?? agentRaw.agent_id ?? agentRaw.name;
+  if (typeof candidate !== 'string') return undefined;
+  const trimmed = candidate.trim();
+  return trimmed.length > 0 ? trimmed : undefined;
+}
+
+/** Queries `baw wallet agent-id` directly for this user's isolated session and syncs it. */
+export async function fetchBawAgentId(userId: number): Promise<string | undefined> {
+  try {
+    const raw = await callBaw(['wallet', 'agent-id'], userId, 10_000) as Record<string, unknown>;
+    const payload = unwrap(raw);
+    const agentIdName = extractAgentIdName(payload);
+    logger.info(
+      { userId, claimed: payload.claimed ?? null, agentIdName: agentIdName ?? null },
+      'baw wallet agent-id lookup',
+    );
+    if (agentIdName) {
+      await syncAgentId(userId, agentIdName);
+    }
+    return agentIdName;
+  } catch (err) {
+    logger.warn({ userId, err: (err as Error).message }, 'fetchBawAgentId failed');
+    return undefined;
+  }
+}
+
 /** Re-reads wallet address + agent ID from baw and updates the session cache. */
 async function refreshSessionFromBaw(userId: number): Promise<WalletSession | null> {
   try {
@@ -238,11 +267,7 @@ async function refreshSessionFromBaw(userId: number): Promise<WalletSession | nu
     const walletAddress = extractBscAddress(addrRaw);
     if (!walletAddress) return null;
 
-    // agentId may be at root or nested after unwrap; also check .agentId vs .agent_id
-    const agentIdName =
-      agentRaw.claimed === true && (typeof agentRaw.agentId === 'string' || typeof agentRaw.agent_id === 'string')
-        ? String(agentRaw.agentId ?? agentRaw.agent_id)
-        : undefined;
+    const agentIdName = extractAgentIdName(agentRaw);
 
     const session: WalletSession = {
       qrCodeId: '',
@@ -357,7 +382,9 @@ export function isSessionConnected(userId: number): boolean {
   return !!sessions.get(userId)?.walletAddress;
 }
 
-export async function isSessionConnectedDb(userId: number): Promise<{ connected: boolean; address?: string }> {
+export async function isSessionConnectedDb(
+  userId: number,
+): Promise<{ connected: boolean; address?: string; dbAgentId?: string }> {
   try {
     const { rows } = await pool.query<{
       is_wallet_connected: boolean;
@@ -369,7 +396,9 @@ export async function isSessionConnectedDb(userId: number): Promise<{ connected:
     );
     if (!rows.length || !rows[0].is_wallet_connected) {
       const mem = sessions.get(userId);
-      return mem?.walletAddress ? { connected: true, address: mem.walletAddress } : { connected: false };
+      return mem?.walletAddress
+        ? { connected: true, address: mem.walletAddress, dbAgentId: rows[0]?.agent_id_name ?? undefined }
+        : { connected: false };
     }
     // Restore from baw if memory is cold
     if (!sessions.get(userId)?.walletAddress) {
@@ -390,6 +419,7 @@ export async function isSessionConnectedDb(userId: number): Promise<{ connected:
     return {
       connected: true,
       address: sessions.get(userId)?.walletAddress ?? rows[0].wallet_address ?? undefined,
+      dbAgentId: rows[0].agent_id_name ?? undefined,
     };
   } catch (dbErr) {
     logger.error({ dbErr, userId }, 'isSessionConnectedDb failed — falling back to in-memory session');

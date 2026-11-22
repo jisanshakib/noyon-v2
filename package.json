@@ -4,10 +4,10 @@
   "description": "Public Telegram Bot — BNB Smart Chain mint/sell automation via Binance Agentic Wallet + Gemini AI",
   "main": "dist/index.js",
   "scripts": {
-    "build": "npx tsc",
+    "build": "tsc",
     "start": "node dist/index.js",
-    "dev": "npx ts-node src/index.ts",
-    "typecheck": "npx tsc --noEmit"
+    "dev": "ts-node src/index.ts",
+    "typecheck": "tsc --noEmit"
   },
   "dependencies": {
     "@binance/agentic-wallet": "^1.12.0",
