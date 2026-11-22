@@ -1,17 +1,73 @@
-// src/handlers/wallet.ts — /connect flow with live QR + background verification
+// src/handlers/wallet.ts — /connect flow with live QR, background verification,
+// and immediate on-chain referral/completion eligibility checks.
 import { Context } from 'telegraf';
 import {
   bawAvailable,
   generatePairingUri,
   verifyAndBindSession,
 } from '../wallet.js';
+import {
+  checkWalletReferralEligibility,
+  OTHER_REFERRER_INELIGIBLE_MESSAGE,
+} from '../bsc.js';
+import { ALREADY_COMPLETED_MESSAGE } from '../executor.js';
 import { generateQrBuffer } from '../qr.js';
-import { safeUpdateUser } from '../db.js';
+import {
+  safeUpdateUser,
+  hasCompletedCycleForAgent,
+  getLatestUnfinishedMint,
+} from '../db.js';
 import { KB } from '../keyboards.js';
 import { logger } from '../logger.js';
 
 async function safeAnswerCb(ctx: Context, text?: string): Promise<void> {
   try { if (ctx.callbackQuery) await ctx.answerCbQuery(text); } catch { /* ok */ }
+}
+
+/**
+ * Checks whether a newly connected / already-connected wallet is blocked either
+ * by another referrer on-chain (`OTHER_REFERRER_INELIGIBLE_MESSAGE`) or by prior
+ * completion on the same Agent ID / Agent Wallet (`ALREADY_COMPLETED_MESSAGE`).
+ */
+async function checkConnectedWalletStatus(
+  userId: number,
+  walletAddress: string,
+  agentIdName?: string,
+): Promise<{ blocked: true; message: string; keyboard: typeof KB.start } | { blocked: false }> {
+  const [unfinishedMint, localCompleted] = await Promise.all([
+    getLatestUnfinishedMint(userId, walletAddress),
+    hasCompletedCycleForAgent({ agentIdName: agentIdName ?? null, walletAddress }),
+  ]);
+
+  const onChainElig = await checkWalletReferralEligibility(walletAddress, {
+    hasLocalUnfinishedMint: Boolean(unfinishedMint),
+  });
+
+  if (!onChainElig.eligible && onChainElig.reasonCode === 'OTHER_REFERRER') {
+    logger.info(
+      { userId, walletAddress, agentIdName, details: onChainElig.details },
+      'Wallet connect blocked: already completed under another referral code',
+    );
+    return {
+      blocked: true,
+      message: OTHER_REFERRER_INELIGIBLE_MESSAGE,
+      keyboard: KB.start,
+    };
+  }
+
+  if (localCompleted.completed || onChainElig.reasonCode === 'ALREADY_COMPLETED_OWN_REFERRER') {
+    logger.info(
+      { userId, walletAddress, agentIdName, matchedBy: localCompleted.matchedBy ?? 'onchain' },
+      'Wallet connect notice: Agent ID / Wallet already completed a full cycle',
+    );
+    return {
+      blocked: true,
+      message: ALREADY_COMPLETED_MESSAGE,
+      keyboard: KB.start,
+    };
+  }
+
+  return { blocked: false };
 }
 
 export async function handleConnectWallet(ctx: Context): Promise<void> {
@@ -41,8 +97,14 @@ export async function handleConnectWallet(ctx: Context): Promise<void> {
       return;
     }
 
-    // Handle already-connected case
+    // Handle already-connected case — still run live on-chain referral/completion check
     if (session.walletAddress) {
+      const status = await checkConnectedWalletStatus(userId, session.walletAddress, session.agentIdName);
+      if (status.blocked) {
+        await ctx.reply(status.message, status.keyboard);
+        return;
+      }
+
       await ctx.reply(
         `✅ Already connected!\n\nAddress: ${session.walletAddress}\n` +
         (session.agentIdName ? `Agent ID: ${session.agentIdName}\n` : '') +
@@ -77,12 +139,24 @@ export async function handleConnectWallet(ctx: Context): Promise<void> {
       await ctx.reply(qrCaption, KB.cancelOnly);
     }
 
-    // Background verification — bot sends confirmation when user approves in Binance app
+    // Background verification — checks on-chain referral eligibility immediately upon binding
     verifyAndBindSession(
       userId,
       session.qrCodeId,
       async (connected) => {
         try {
+          if (connected.walletAddress) {
+            const status = await checkConnectedWalletStatus(
+              userId,
+              connected.walletAddress,
+              connected.agentIdName,
+            );
+            if (status.blocked) {
+              await ctx.reply(status.message, status.keyboard);
+              return;
+            }
+          }
+
           await ctx.reply(
             `✅ Wallet connected!\n\n` +
             `Address: ${connected.walletAddress}\n` +

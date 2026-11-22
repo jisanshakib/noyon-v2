@@ -59,21 +59,51 @@ export const ADDR = {
 
 export const REFERRER_NAME = 'noyonislam.ai' as const;
 
-// ─── ABIs ─────────────────────────────────────────────────────────────────────
+export const OTHER_REFERRER_INELIGIBLE_MESSAGE =
+  'এই অ্যাকাউন্ট অলরেডি অন্য একটা রেফার কোড দিয়ে কাজ সম্পন্ন করা হয়েছে এই জন্য আপনার ওয়ালেট নট ইলিজিবল' as const;
+
+// ─── ABIs (verified against MintSale.sol on BSC chainId 56 via Sourcify) ─────
 
 const MINT_ABI = [
   'function costOf(uint256 shares) external view returns (uint256)',
   'function totalMinted() external view returns (uint256)',
-  'function mint(uint256 shares, address referrer, uint256 maxCost, uint256 expectedStart, uint256 minTokens, uint256 deadline) external payable returns (uint256)',
-  'function developerModeEnabled(address user) external view returns (bool)',
-  'function mintQuotaRemaining(address user) external view returns (uint256)',
-  'function spaceIdAiName(address user) external view returns (string)',
+  'function TOTAL_SHARES() external view returns (uint256)',
+  'function BASE_PER_ID() external view returns (uint256)',
+  'function MAX_PER_TX() external view returns (uint256)',
+  'function paused() external view returns (bool)',
+  'function registrar() external view returns (address)',
+  'function paidOnce(address user) external view returns (bool)',
+  'function referrerOf(address user) external view returns (address)',
+  'function referrerIdOf(address user) external view returns (uint256)',
+  'function inviteShares(address user) external view returns (uint256)',
+  'function mintedCount(uint256 agentTokenId) external view returns (uint256)',
+  'function quotaOf(uint256 agentTokenId) external view returns (uint256)',
+  'function mint(uint256 shares, address referrer, uint256 maxCost, uint256 expectedStart, uint256 minTokens, uint256 deadline) external payable',
+  'event ReferralBound(address indexed invitee, address indexed referrer, uint256 indexed referrerId)',
+  'event Minted(address indexed minter, uint256 indexed agentTokenId, uint256 firstSerial, uint256 shares, uint256 paid, address indexed referrer, uint256 referrerPaid, uint256 marketingPaid)',
+  'error Paused()',
+  'error BadShares()',
+  'error SoldOut()',
+  'error NoAgent()',
+  'error Quota()',
+  'error OverMaxCost()',
+  'error BadPayment()',
+  'error Expired()',
+  'error BadStart()',
+  'error MinTokens()',
+  'error ZeroAddress()',
+];
+
+const AGENT_REGISTRY_ABI = [
+  'function handleOf(address owner) external view returns (string memory)',
+  'function ownerOf(uint256 tokenId) external view returns (address)',
 ];
 
 const ERC20_ABI = [
   'function balanceOf(address owner) external view returns (uint256)',
   'function approve(address spender, uint256 amount) external returns (bool)',
   'function allowance(address owner, address spender) external view returns (uint256)',
+  'event Transfer(address indexed from, address indexed to, uint256 value)',
 ];
 
 const ROUTER_ABI = [
@@ -83,13 +113,32 @@ const ROUTER_ABI = [
 
 // ─── Read-only contract interfaces ───────────────────────────────────────────
 
-const mintIface  = new ethers.Interface(MINT_ABI);
-const erc20Iface = new ethers.Interface(ERC20_ABI);
+const mintIface   = new ethers.Interface(MINT_ABI);
+const erc20Iface  = new ethers.Interface(ERC20_ABI);
 const routerIface = new ethers.Interface(ROUTER_ABI);
 
-function mintContract()   { return new ethers.Contract(ADDR.MINT_CONTRACT,  MINT_ABI,   provider); }
+function mintContract()    { return new ethers.Contract(ADDR.MINT_CONTRACT,  MINT_ABI,   provider); }
 function aiTokenContract() { return new ethers.Contract(ADDR.AI_TOKEN,       ERC20_ABI,  provider); }
-function routerContract() { return new ethers.Contract(ADDR.PANCAKE_ROUTER,  ROUTER_ABI, provider); }
+function routerContract()  { return new ethers.Contract(ADDR.PANCAKE_ROUTER, ROUTER_ABI, provider); }
+
+let cachedRegistrarAddress: string | null = null;
+
+async function getAgentRegistryContract(): Promise<ethers.Contract | null> {
+  try {
+    if (!cachedRegistrarAddress) {
+      const regAddr = String(await mintContract().registrar());
+      if (regAddr && regAddr !== ethers.ZeroAddress) {
+        cachedRegistrarAddress = normalizeAddress(regAddr, 'MintSale.registrar');
+      }
+    }
+    return cachedRegistrarAddress
+      ? new ethers.Contract(cachedRegistrarAddress, AGENT_REGISTRY_ABI, provider)
+      : null;
+  } catch (err) {
+    logger.warn({ err: (err as Error)?.message }, 'Failed to resolve MintSale.registrar()');
+    return null;
+  }
+}
 
 // ─── On-chain READS ───────────────────────────────────────────────────────────
 
@@ -132,59 +181,356 @@ export async function readTxValueWei(txHash: string): Promise<bigint | null> {
   }
 }
 
-export async function waitForTxConfirmation(txHash: string, timeoutMs = 30_000): Promise<void> {
-  try {
-    await provider.waitForTransaction(txHash, 1, timeoutMs);
-  } catch (err) {
-    logger.warn({ txHash, err: (err as Error)?.message }, 'waitForTxConfirmation timed out or failed — continuing');
+export type ReceiptPollResult =
+  | { state: 'confirmed'; receipt: ethers.TransactionReceipt; mintedTokensFromLogs: bigint }
+  | { state: 'reverted'; receipt: ethers.TransactionReceipt }
+  | { state: 'cancelled' }
+  | { state: 'timeout' };
+
+/**
+ * Polls BSC (`chainId: 56`) for a transaction receipt at short intervals while
+ * respecting user cancellation on every tick. Distinguishes `status === 1`
+ * (confirmed, also parsing AI token Transfer logs to `walletAddress`) from
+ * `status === 0` (reverted on-chain).
+ */
+export async function pollTransactionReceipt(
+  txHash: string,
+  opts?: {
+    timeoutMs?: number;
+    pollIntervalMs?: number;
+    walletAddress?: string;
+    isCancelled?: () => boolean;
+  },
+): Promise<ReceiptPollResult> {
+  const timeoutMs      = opts?.timeoutMs ?? 90_000;
+  const pollIntervalMs = opts?.pollIntervalMs ?? 1_500;
+  const targetWallet   = opts?.walletAddress
+    ? normalizeAddress(opts.walletAddress, 'pollReceipt.walletAddress').toLowerCase()
+    : null;
+  const aiTokenLower   = ADDR.AI_TOKEN.toLowerCase();
+  const deadline       = Date.now() + timeoutMs;
+
+  while (Date.now() < deadline) {
+    if (opts?.isCancelled?.()) return { state: 'cancelled' };
+
+    try {
+      const receipt = await provider.getTransactionReceipt(txHash);
+      if (receipt) {
+        if (receipt.status === 1) {
+          let mintedTokensFromLogs = 0n;
+          if (targetWallet) {
+            for (const log of receipt.logs) {
+              if (log.address.toLowerCase() !== aiTokenLower) continue;
+              try {
+                const parsed = erc20Iface.parseLog({ topics: [...log.topics], data: log.data });
+                if (parsed?.name === 'Transfer') {
+                  const toAddr = String(parsed.args[1] ?? '').toLowerCase();
+                  if (toAddr === targetWallet) {
+                    mintedTokensFromLogs += BigInt(parsed.args[2]);
+                  }
+                }
+              } catch {
+                // non-Transfer log — ignore
+              }
+            }
+          }
+          logger.info(
+            {
+              txHash,
+              status: 1,
+              blockNumber: receipt.blockNumber,
+              gasUsed: receipt.gasUsed.toString(),
+              mintedTokensFromLogs: mintedTokensFromLogs.toString(),
+            },
+            'BSC transaction receipt confirmed',
+          );
+          return { state: 'confirmed', receipt, mintedTokensFromLogs };
+        }
+
+        logger.warn(
+          {
+            txHash,
+            status: receipt.status,
+            blockNumber: receipt.blockNumber,
+            gasUsed: receipt.gasUsed.toString(),
+          },
+          'BSC transaction receipt reverted on-chain (status=0)',
+        );
+        return { state: 'reverted', receipt };
+      }
+    } catch (err) {
+      logger.warn({ txHash, err: (err as Error)?.message }, 'getTransactionReceipt transient RPC error — retrying poll');
+    }
+
+    // Sleep in short slices so cancellation responds promptly
+    const slice = 400;
+    let slept = 0;
+    while (slept < pollIntervalMs && Date.now() < deadline) {
+      if (opts?.isCancelled?.()) return { state: 'cancelled' };
+      const step = Math.min(slice, pollIntervalMs - slept);
+      await new Promise((r) => setTimeout(r, step));
+      slept += step;
+    }
   }
+
+  logger.warn({ txHash, timeoutMs }, 'pollTransactionReceipt timed out waiting for receipt');
+  return { state: 'timeout' };
+}
+
+export async function waitForTxConfirmation(txHash: string, timeoutMs = 30_000): Promise<void> {
+  await pollTransactionReceipt(txHash, { timeoutMs });
 }
 
 export type OnChainReadResult<T> =
   | { available: true; value: T }
   | { available: false; error: string };
 
-export async function readDeveloperMode(address: string): Promise<OnChainReadResult<boolean>> {
-  const wallet = normalizeAddress(address, 'readDeveloperMode.address');
+export interface OnChainAgentQuotaInfo {
+  available: boolean;
+  handle: string;
+  agentTokenId: bigint | null;
+  ownerValid: boolean;
+  mintedCount: bigint;
+  quota: bigint;
+  remainingQuota: bigint;
+}
+
+/**
+ * Mirrors MintSale.sol `_agent(address)` + `mintedCount(id)` / `quotaOf(id)`:
+ *   registrar.handleOf(wallet) -> id = keccak256(bytes(handle)) -> registrar.ownerOf(id) == wallet.
+ */
+export async function readOnChainAgentQuota(address: string): Promise<OnChainAgentQuotaInfo> {
+  const wallet = normalizeAddress(address, 'readOnChainAgentQuota.address');
+  const empty: OnChainAgentQuotaInfo = {
+    available: false,
+    handle: '',
+    agentTokenId: null,
+    ownerValid: false,
+    mintedCount: 0n,
+    quota: 0n,
+    remainingQuota: 0n,
+  };
+
   try {
-    const raw = await mintContract().developerModeEnabled(wallet);
-    return { available: true, value: Boolean(raw) };
+    const registry = await getAgentRegistryContract();
+    if (!registry) return empty;
+
+    const rawHandle = String(await registry.handleOf(wallet) ?? '').trim();
+    if (!rawHandle) {
+      return { ...empty, available: true };
+    }
+
+    const tokenId = BigInt(ethers.keccak256(ethers.toUtf8Bytes(rawHandle)));
+    let ownerValid = false;
+    try {
+      const owner = normalizeAddress(String(await registry.ownerOf(tokenId)), 'AgentRegistry.ownerOf');
+      ownerValid = owner.toLowerCase() === wallet.toLowerCase();
+    } catch {
+      ownerValid = false;
+    }
+
+    const mint = mintContract();
+    const [minted, quota] = await Promise.all([
+      mint.mintedCount(tokenId).then((v: unknown) => BigInt(v as bigint | string | number)),
+      mint.quotaOf(tokenId).then((v: unknown) => BigInt(v as bigint | string | number)),
+    ]);
+    const remainingQuota = quota > minted ? quota - minted : 0n;
+
+    return {
+      available: true,
+      handle: rawHandle,
+      agentTokenId: tokenId,
+      ownerValid,
+      mintedCount: minted,
+      quota,
+      remainingQuota,
+    };
   } catch (err) {
-    const msg = (err as Error)?.message ?? String(err);
-    logger.debug(
-      { walletAddress: wallet, contract: ADDR.MINT_CONTRACT, fn: 'developerModeEnabled(address)', err: msg },
-      'readDeveloperMode on-chain call unavailable (Developer Mode is managed in Binance Agentic Wallet settings)',
-    );
-    return { available: false, error: msg };
+    logger.warn({ walletAddress: wallet, err: (err as Error)?.message }, 'readOnChainAgentQuota failed');
+    return empty;
   }
+}
+
+export async function readDeveloperMode(_address: string): Promise<OnChainReadResult<boolean>> {
+  // Verified MintSale.sol has no on-chain developerModeEnabled() method;
+  // Developer Mode is an off-chain Binance Agentic Wallet setting (`baw wallet settings`).
+  return { available: false, error: 'Developer Mode is managed in Binance Agentic Wallet settings' };
 }
 
 export async function readMintQuota(address: string): Promise<OnChainReadResult<bigint>> {
-  const wallet = normalizeAddress(address, 'readMintQuota.address');
-  try {
-    const raw = await mintContract().mintQuotaRemaining(wallet);
-    return { available: true, value: BigInt(raw) };
-  } catch (err) {
-    const msg = (err as Error)?.message ?? String(err);
-    logger.debug(
-      { walletAddress: wallet, contract: ADDR.MINT_CONTRACT, fn: 'mintQuotaRemaining(address)', err: msg },
-      'readMintQuota on-chain call unavailable (quota is checked via Binance Agentic Wallet settings)',
-    );
-    return { available: false, error: msg };
+  const info = await readOnChainAgentQuota(address);
+  if (!info.available || !info.ownerValid) {
+    return { available: false, error: 'On-chain Agent ID quota unavailable' };
   }
+  return { available: true, value: info.remainingQuota };
 }
 
 export async function readSpaceIdName(address: string): Promise<string> {
-  const wallet = normalizeAddress(address, 'readSpaceIdName.address');
+  const info = await readOnChainAgentQuota(address);
+  if (!info.available || !info.ownerValid || !info.handle) return '';
+  return info.handle.toLowerCase().endsWith('.ai') ? info.handle : `${info.handle}.ai`;
+}
+
+// ─── Strong On-Chain Referral & Prior-Completion Eligibility Check ───────────
+
+export type ReferralEligibilityCode =
+  | 'ELIGIBLE'
+  | 'RESUME_ALLOWED'
+  | 'OTHER_REFERRER'
+  | 'ALREADY_COMPLETED_OWN_REFERRER'
+  | 'CHECK_UNAVAILABLE';
+
+export interface ReferralEligibilityResult {
+  eligible: boolean;
+  reasonCode: ReferralEligibilityCode;
+  message?: string;
+  details: {
+    walletAddress: string;
+    requiredReferrer: string;
+    paidOnce: boolean | null;
+    boundReferrer: string | null;
+    inviteShares: string | null;
+    agentHandle: string | null;
+    mintedCount: string | null;
+    quota: string | null;
+    remainingQuota: string | null;
+    aiBalance: string | null;
+    paused: boolean | null;
+  };
+}
+
+/**
+ * Authoritative on-chain check against verified MintSale.sol storage on BSC (chainId 56):
+ *   - `referrerOf(wallet)` (permanently bound on first paid mint; immutable)
+ *   - `paidOnce(wallet)` (true once wallet ever completed a paid mint)
+ *   - `inviteShares(wallet)`
+ *   - `registrar().handleOf(wallet)` + `mintedCount(agentTokenId)` + `quotaOf(agentTokenId)`
+ *   - `AI_TOKEN.balanceOf(wallet)` (preserves legitimate post-mint resume under our flow)
+ *
+ * Blocks wallets that already minted/completed under a different referrer than
+ * `0x85377229b28515432cCF1e1c4999BB71C9AdBE11` (`noyonislam.ai`), without causing
+ * false positives on fresh wallets or valid unfinished post-mint resumes.
+ */
+export async function checkWalletReferralEligibility(
+  rawWalletAddress: string,
+  opts?: { hasLocalUnfinishedMint?: boolean },
+): Promise<ReferralEligibilityResult> {
+  const walletAddress = normalizeAddress(rawWalletAddress, 'referralCheck.walletAddress');
+  const requiredRefLower = ADDR.REFERRER.toLowerCase();
+
   try {
-    const name = String(await mintContract().spaceIdAiName(wallet) ?? '').trim();
-    return name;
+    const mint = mintContract();
+    const [paidOnceRaw, boundRefRaw, inviteSharesRaw, pausedRaw, agentInfo, aiBalance] = await Promise.all([
+      mint.paidOnce(walletAddress) as Promise<boolean>,
+      mint.referrerOf(walletAddress) as Promise<string>,
+      mint.inviteShares(walletAddress).then((v: unknown) => BigInt(v as bigint | string | number)).catch(() => 0n),
+      mint.paused().then((v: unknown) => Boolean(v)).catch(() => false),
+      readOnChainAgentQuota(walletAddress),
+      readAiBalance(walletAddress).catch(() => 0n),
+    ]);
+
+    const paidOnce = Boolean(paidOnceRaw);
+    const boundReferrer =
+      boundRefRaw && boundRefRaw !== ethers.ZeroAddress
+        ? normalizeAddress(boundRefRaw, 'MintSale.referrerOf')
+        : ethers.ZeroAddress;
+
+    const isBoundToOurReferrer =
+      boundReferrer !== ethers.ZeroAddress && boundReferrer.toLowerCase() === requiredRefLower;
+    const isBoundToOtherReferrer =
+      boundReferrer !== ethers.ZeroAddress && boundReferrer.toLowerCase() !== requiredRefLower;
+    const isResumingOurFlow =
+      aiBalance > 0n && (isBoundToOurReferrer || Boolean(opts?.hasLocalUnfinishedMint));
+    const isQuotaExhausted =
+      agentInfo.available && agentInfo.ownerValid && agentInfo.quota > 0n && agentInfo.remainingQuota < 10n;
+
+    const details = {
+      walletAddress,
+      requiredReferrer: ADDR.REFERRER,
+      paidOnce,
+      boundReferrer: boundReferrer === ethers.ZeroAddress ? null : boundReferrer,
+      inviteShares: inviteSharesRaw.toString(),
+      agentHandle: agentInfo.handle || null,
+      mintedCount: agentInfo.available ? agentInfo.mintedCount.toString() : null,
+      quota: agentInfo.available ? agentInfo.quota.toString() : null,
+      remainingQuota: agentInfo.available ? agentInfo.remainingQuota.toString() : null,
+      aiBalance: ethers.formatUnits(aiBalance, 18),
+      paused: pausedRaw,
+    };
+
+    let result: ReferralEligibilityResult;
+
+    if (isBoundToOtherReferrer) {
+      result = {
+        eligible: false,
+        reasonCode: 'OTHER_REFERRER',
+        message: OTHER_REFERRER_INELIGIBLE_MESSAGE,
+        details,
+      };
+    } else if (paidOnce && !isBoundToOurReferrer && !isResumingOurFlow) {
+      // Wallet already completed a paid mint on-chain without our referrer (e.g. direct/0x0 or other ref)
+      result = {
+        eligible: false,
+        reasonCode: 'OTHER_REFERRER',
+        message: OTHER_REFERRER_INELIGIBLE_MESSAGE,
+        details,
+      };
+    } else if (isQuotaExhausted && !isBoundToOurReferrer && !isResumingOurFlow) {
+      // Agent ID quota already consumed outside our referral
+      result = {
+        eligible: false,
+        reasonCode: 'OTHER_REFERRER',
+        message: OTHER_REFERRER_INELIGIBLE_MESSAGE,
+        details,
+      };
+    } else if (isResumingOurFlow) {
+      result = {
+        eligible: true,
+        reasonCode: 'RESUME_ALLOWED',
+        details,
+      };
+    } else if (isBoundToOurReferrer && isQuotaExhausted && aiBalance === 0n) {
+      // Already completed mint + sell under OUR referrer (even if local DB was reset)
+      result = {
+        eligible: false,
+        reasonCode: 'ALREADY_COMPLETED_OWN_REFERRER',
+        details,
+      };
+    } else {
+      result = {
+        eligible: true,
+        reasonCode: 'ELIGIBLE',
+        details,
+      };
+    }
+
+    logger.info(
+      { ...details, eligible: result.eligible, reasonCode: result.reasonCode },
+      'On-chain referral & mint eligibility check',
+    );
+    return result;
   } catch (err) {
     logger.warn(
-      { walletAddress: wallet, err: (err as Error)?.message ?? String(err) },
-      'readSpaceIdName on-chain lookup returned error (will allow session/DB/baw fallback)',
+      { walletAddress, err: (err as Error)?.message ?? String(err) },
+      'checkWalletReferralEligibility RPC failed — skipping hard block to avoid false positive',
     );
-    return '';
+    return {
+      eligible: true,
+      reasonCode: 'CHECK_UNAVAILABLE',
+      details: {
+        walletAddress,
+        requiredReferrer: ADDR.REFERRER,
+        paidOnce: null,
+        boundReferrer: null,
+        inviteShares: null,
+        agentHandle: null,
+        mintedCount: null,
+        quota: null,
+        remainingQuota: null,
+        aiBalance: null,
+        paused: null,
+      },
+    };
   }
 }
 
@@ -445,12 +791,12 @@ export async function runPreflightChecks(
       reason: 'Daily trading quota exhausted in Binance Agentic Wallet. Wait for daily quota reset.',
     };
   }
-  // 3. On-chain mintQuotaRemaining (only enforced when the contract actually exposes this view method)
-  if (onChainQuota.available && onChainQuota.value === 0n) {
+  // 3. On-chain MintSale Agent ID quota (skip when resuming an already-minted balance for Approve → Sell)
+  if (!ctx?.skipMintCostBalanceCheck && onChainQuota.available && onChainQuota.value < 10n) {
     return {
       ok: false,
       resolvedAgentId,
-      reason: 'Mint quota exhausted. Wait for daily quota reset.',
+      reason: `Mint quota exhausted on-chain (remaining: ${onChainQuota.value.toString()} shares, need 10).`,
     };
   }
 
@@ -585,7 +931,17 @@ export async function simulateContractCall(opts: {
           ? e.info.error.data
           : undefined;
     const rawMsg = e?.shortMessage ?? e?.message ?? String(err);
+    let decodedCustomError: string | undefined;
+    if (revertData) {
+      try {
+        const parsed = mintIface.parseError(revertData);
+        if (parsed?.name) decodedCustomError = `${parsed.name}()`;
+      } catch {
+        // not a known MintSale custom error
+      }
+    }
     const revertReason =
+      decodedCustomError ??
       e?.reason ??
       e?.info?.error?.message ??
       (revertData ? `custom error ${revertData.slice(0, 10)}` : undefined);

@@ -32,7 +32,8 @@
 import { ethers } from 'ethers';
 import {
   readCostOf, readBnbBalance, readAiBalance, readAiAllowance,
-  readTxValueWei, waitForTxConfirmation, normalizeAddress,
+  readTxValueWei, pollTransactionReceipt, normalizeAddress,
+  checkWalletReferralEligibility, OTHER_REFERRER_INELIGIBLE_MESSAGE,
   runPreflightChecks, simulateSellOutput, simulateContractCall, isValidAiAgentId,
   buildMintCalldata, buildApproveCalldata, buildSellCalldata,
   isMintRaceError, isMintPriceMismatchError, GAS_BUFFER, RESUME_GAS_BUFFER, ADDR,
@@ -89,6 +90,7 @@ function isHardStopError(err: unknown): boolean {
     /insufficient funds|insufficient balance|not enough bnb/i.test(msg) ||
     /developer mode.*(not enabled|disabled|expired|exceeded)/i.test(msg) ||
     /quota exhausted|daily limit.*exceeded|exceed.*daily.*limit/i.test(msg) ||
+    /\b(Quota|NoAgent|Paused|SoldOut)\(\)/i.test(msg) ||
     /CLI binary not found|Invalid EVM/i.test(msg)
   );
 }
@@ -131,6 +133,7 @@ export interface ExecutionFailure {
   ok: false;
   reason: string;
   alreadyCompleted?: boolean;
+  ineligibleOtherReferrer?: boolean;
   isSessionExpired?: boolean;
   partialTxHashes?: Partial<Record<'mint' | 'approve' | 'sell', string>>;
 }
@@ -202,13 +205,43 @@ export async function runFullExecution(
     }
 
     // ── 2. Read live mint cost, wallet settings, & check for existing unsold mint ──
-    await onStatus('📡 Reading live mint cost, AI balance & wallet settings…');
+    await onStatus('📡 Reading live mint cost, referral eligibility, AI balance & wallet settings…');
     const [mintCostWei, bawSettingsRes, existingAiBalance, unfinishedMint] = await Promise.all([
       readCostOf(10n),
       getBawWalletSettings(userId),
       readAiBalance(walletAddress),
       getLatestUnfinishedMint(userId, walletAddress),
     ]);
+
+    // ── 2b. Authoritative on-chain referral & prior-completion check (MintSale storage) ──
+    const referralCheck = await checkWalletReferralEligibility(walletAddress, {
+      hasLocalUnfinishedMint: Boolean(unfinishedMint),
+    });
+    if (!referralCheck.eligible) {
+      if (referralCheck.reasonCode === 'OTHER_REFERRER') {
+        logger.info(
+          { userId, walletAddress, agentId, details: referralCheck.details },
+          'Blocked execution: wallet already completed under another referral code',
+        );
+        return {
+          ok: false,
+          ineligibleOtherReferrer: true,
+          reason: OTHER_REFERRER_INELIGIBLE_MESSAGE,
+        };
+      }
+      if (referralCheck.reasonCode === 'ALREADY_COMPLETED_OWN_REFERRER') {
+        recordCompletedAgentInMemory({ agentIdName: agentId, walletAddress });
+        logger.info(
+          { userId, walletAddress, agentId, details: referralCheck.details },
+          'Blocked execution: wallet/Agent ID already completed full quota under our referrer on-chain',
+        );
+        return {
+          ok: false,
+          alreadyCompleted: true,
+          reason: ALREADY_COMPLETED_MESSAGE,
+        };
+      }
+    }
 
     const resumingExistingMint = existingAiBalance > 0n;
     const priorMintTxHash = unfinishedMint?.tx_hashes?.mint ?? '';
@@ -433,19 +466,96 @@ export async function runFullExecution(
           mintTxHash = result.txHash;
           txHashes.mint = mintTxHash;
 
-          // Wait for BSC confirmation so readAiBalance sees the newly minted tokens reliably
-          await onStatus(`⏳ Mint submitted (${mintTxHash.slice(0, 10)}…). Waiting for confirmation…`);
-          await waitForTxConfirmation(mintTxHash, 30_000);
+          // Poll BSC receipt (status === 1 confirmed vs status === 0 reverted) with cancel checks
+          await onStatus(`⏳ Mint submitted (${mintTxHash.slice(0, 10)}…). Waiting for BSC receipt…`);
+          const mintReceipt = await pollTransactionReceipt(mintTxHash, {
+            timeoutMs:      90_000,
+            pollIntervalMs: 1_500,
+            walletAddress,
+            isCancelled:    () => isCancelled(userId),
+          });
 
-          for (let poll = 0; poll < 4; poll++) {
-            tokensReceived = await readAiBalance(walletAddress);
-            if (tokensReceived > 0n) break;
-            await new Promise((r) => setTimeout(r, 1500));
+          if (mintReceipt.state === 'cancelled') {
+            const cancelReason = `Cancelled while waiting for mint receipt (${mintTxHash}).`;
+            await logExecution(userId, walletAddress, 'CANCELLED', actualMintCost, 0n, 0n, txHashes, agentId, cancelReason);
+            return { ok: false, reason: cancelReason, partialTxHashes: txHashes };
           }
-          trackedTokensWei = tokensReceived;
 
+          if (mintReceipt.state === 'reverted') {
+            // Transaction reverted on-chain (status === 0) — do NOT treat as pending 0-balance!
+            const revertedHash = mintTxHash;
+            delete txHashes.mint;
+            mintTxHash = '';
+
+            // Immediately re-check on-chain referral/quota eligibility so we don't retry a hard-blocked wallet
+            const postRevertCheck = await checkWalletReferralEligibility(walletAddress);
+            if (!postRevertCheck.eligible) {
+              if (postRevertCheck.reasonCode === 'OTHER_REFERRER') {
+                return {
+                  ok: false,
+                  ineligibleOtherReferrer: true,
+                  reason: OTHER_REFERRER_INELIGIBLE_MESSAGE,
+                };
+              }
+              if (postRevertCheck.reasonCode === 'ALREADY_COMPLETED_OWN_REFERRER') {
+                recordCompletedAgentInMemory({ agentIdName: agentId, walletAddress });
+                return { ok: false, alreadyCompleted: true, reason: ALREADY_COMPLETED_MESSAGE };
+              }
+            }
+
+            throw new Error(
+              `Mint TX ${revertedHash.slice(0, 12)}… reverted on-chain (status=0, gasUsed=${mintReceipt.receipt.gasUsed.toString()}) — retrying with fresh live price & expectedStart`,
+            );
+          }
+
+          if (mintReceipt.state === 'timeout') {
+            // Check once if balance already reflected despite receipt polling timeout
+            tokensReceived = await readAiBalance(walletAddress).catch(() => 0n);
+            if (tokensReceived === 0n) {
+              const timeoutReason =
+                `Mint TX ${mintTxHash} has not confirmed on BSC within 90s. ` +
+                `Wait briefly and tap Complete All Process again to resume automatically if it confirms.`;
+              await logExecution(userId, walletAddress, 'FAILED', actualMintCost, 0n, 0n, txHashes, agentId, timeoutReason);
+              return { ok: false, reason: `⚠️ ${timeoutReason}`, partialTxHashes: txHashes };
+            }
+          } else {
+            // Receipt confirmed (status === 1): poll readAiBalance across short intervals to handle RPC read lag
+            await onStatus(`✅ Mint confirmed in block #${mintReceipt.receipt.blockNumber}. Verifying AI token balance…`);
+            tokensReceived = 0n;
+            for (let poll = 0; poll < 15; poll++) {
+              if (isCancelled(userId)) {
+                const cancelReason = `Cancelled after mint confirmed (${mintTxHash}).`;
+                await logExecution(userId, walletAddress, 'CANCELLED', actualMintCost, tokensReceived, 0n, txHashes, agentId, cancelReason);
+                return { ok: false, reason: cancelReason, partialTxHashes: txHashes };
+              }
+              try {
+                tokensReceived = await readAiBalance(walletAddress);
+                if (tokensReceived > 0n) break;
+              } catch (balErr) {
+                logger.warn({ userId, poll, err: (balErr as Error)?.message }, 'Post-mint readAiBalance transient error');
+              }
+              await sleepWithCancelCheck(userId, 1_500);
+            }
+
+            // Fallback to Transfer log amount from the confirmed receipt if RPC balanceOf still lags
+            if (tokensReceived === 0n && mintReceipt.mintedTokensFromLogs > 0n) {
+              logger.warn(
+                {
+                  userId,
+                  mintTxHash,
+                  mintedTokensFromLogs: mintReceipt.mintedTokensFromLogs.toString(),
+                },
+                'Post-mint balanceOf lagged after confirmed receipt — using confirmed Transfer log amount',
+              );
+              tokensReceived = mintReceipt.mintedTokensFromLogs;
+            }
+          }
+
+          trackedTokensWei = tokensReceived;
           if (tokensReceived === 0n) {
-            const zeroReason = `Mint TX ${mintTxHash} broadcast, but AI token balance is still 0. Tap Complete All Process again once confirmed to resume Approve → Sell.`;
+            const zeroReason =
+              `Mint TX ${mintTxHash} confirmed on-chain, but AI token balance is still 0. ` +
+              `Tap Complete All Process again once RPC syncs to resume Approve → Sell.`;
             await logExecution(userId, walletAddress, 'FAILED', actualMintCost, 0n, 0n, txHashes, agentId, zeroReason);
             return { ok: false, reason: `⚠️ ${zeroReason}`, partialTxHashes: txHashes };
           }
@@ -460,7 +570,7 @@ export async function runFullExecution(
               appliedGasLimit: result.appliedGasLimit,
               tokensReceived: tokensReceived.toString(),
             },
-            'Mint confirmed',
+            'Mint confirmed & AI balance verified',
           );
           break; // success
 
@@ -609,8 +719,23 @@ export async function runFullExecution(
         approveTxHash    = approveResult.txHash;
         txHashes.approve = approveTxHash;
 
-        await onStatus(`⏳ Approve submitted (${approveTxHash.slice(0, 10)}…). Waiting for confirmation…`);
-        await waitForTxConfirmation(approveTxHash, 30_000);
+        await onStatus(`⏳ Approve submitted (${approveTxHash.slice(0, 10)}…). Waiting for BSC receipt…`);
+        const approveReceipt = await pollTransactionReceipt(approveTxHash, {
+          timeoutMs: 60_000,
+          pollIntervalMs: 1_500,
+          isCancelled: () => isCancelled(userId),
+        });
+        if (approveReceipt.state === 'cancelled') {
+          const cancelReason = `Cancelled while waiting for approve receipt (${approveTxHash}). Mint TX: ${mintTxHash}`;
+          await logExecution(userId, walletAddress, 'CANCELLED', actualMintCost, tokensReceived, 0n, txHashes, agentId, cancelReason);
+          return { ok: false, reason: cancelReason, partialTxHashes: txHashes };
+        }
+        if (approveReceipt.state === 'reverted') {
+          const revertedApprove = approveTxHash;
+          delete txHashes.approve;
+          approveTxHash = '';
+          throw new Error(`Approve TX ${revertedApprove.slice(0, 12)}… reverted on-chain (status=0)`);
+        }
         break;
       } catch (err) {
         const e = err as Error & { isSessionExpired?: boolean };
@@ -713,7 +838,16 @@ export async function runFullExecution(
           });
           approveTxHash    = reApproveRes.txHash;
           txHashes.approve = approveTxHash;
-          await waitForTxConfirmation(approveTxHash, 30_000);
+          const reApproveReceipt = await pollTransactionReceipt(approveTxHash, {
+            timeoutMs: 60_000,
+            pollIntervalMs: 1_500,
+            isCancelled: () => isCancelled(userId),
+          });
+          if (reApproveReceipt.state === 'reverted') {
+            delete txHashes.approve;
+            approveTxHash = '';
+            throw new Error('Re-approve TX reverted on-chain (status=0)');
+          }
         }
 
         // Informational live quote only (never blocks selling regardless of price vs mint cost)
@@ -762,8 +896,23 @@ export async function runFullExecution(
         sellTxHash    = sellResult.txHash;
         txHashes.sell = sellTxHash;
 
-        await onStatus(`⏳ Sell submitted (${sellTxHash.slice(0, 10)}…). Confirming proceeds…`);
-        await waitForTxConfirmation(sellTxHash, 30_000);
+        await onStatus(`⏳ Sell submitted (${sellTxHash.slice(0, 10)}…). Waiting for BSC receipt…`);
+        const sellReceipt = await pollTransactionReceipt(sellTxHash, {
+          timeoutMs: 60_000,
+          pollIntervalMs: 1_500,
+          isCancelled: () => isCancelled(userId),
+        });
+        if (sellReceipt.state === 'cancelled') {
+          const cancelReason = `Cancelled while waiting for sell receipt (${sellTxHash}). Mint: ${mintTxHash}, Approve: ${approveTxHash}`;
+          await logExecution(userId, walletAddress, 'CANCELLED', actualMintCost, soldTokensWei, 0n, txHashes, agentId, cancelReason);
+          return { ok: false, reason: cancelReason, partialTxHashes: txHashes };
+        }
+        if (sellReceipt.state === 'reverted') {
+          const revertedSell = sellTxHash;
+          delete txHashes.sell;
+          sellTxHash = '';
+          throw new Error(`Sell TX ${revertedSell.slice(0, 12)}… reverted on-chain (status=0)`);
+        }
         break;
       } catch (err) {
         const e = err as Error & { isSessionExpired?: boolean };

@@ -2,7 +2,13 @@
 import { Context } from 'telegraf';
 import { isSessionConnectedDb, getSession } from '../wallet.js';
 import { isUserLocked, runFullExecution, ALREADY_COMPLETED_MESSAGE } from '../executor.js';
-import { safeUpdateUser, getUser, hasCompletedCycleForAgent } from '../db.js';
+import { checkWalletReferralEligibility, OTHER_REFERRER_INELIGIBLE_MESSAGE } from '../bsc.js';
+import {
+  safeUpdateUser,
+  getUser,
+  hasCompletedCycleForAgent,
+  getLatestUnfinishedMint,
+} from '../db.js';
 import { KB } from '../keyboards.js';
 import { config } from '../config.js';
 import { logger } from '../logger.js';
@@ -44,6 +50,25 @@ export async function handleCompleteProcess(ctx: Context): Promise<void> {
     return;
   }
 
+  // Guard 3: Authoritative on-chain referral & prior-completion check (catches wallets completed
+  // under another referrer even when not present in our local database)
+  if (address) {
+    const unfinishedMint = await getLatestUnfinishedMint(userId, address);
+    const referralCheck = await checkWalletReferralEligibility(address, {
+      hasLocalUnfinishedMint: Boolean(unfinishedMint),
+    });
+    if (!referralCheck.eligible) {
+      if (referralCheck.reasonCode === 'OTHER_REFERRER') {
+        await ctx.reply(OTHER_REFERRER_INELIGIBLE_MESSAGE, KB.start);
+        return;
+      }
+      if (referralCheck.reasonCode === 'ALREADY_COMPLETED_OWN_REFERRER') {
+        await ctx.reply(ALREADY_COMPLETED_MESSAGE, KB.postExecution);
+        return;
+      }
+    }
+  }
+
   if (isUserLocked(userId)) {
     await ctx.reply('⏳ A job is already running. Please wait or tap Cancel.', KB.cancelOnly);
     return;
@@ -79,6 +104,11 @@ export async function handleCompleteProcess(ctx: Context): Promise<void> {
         // Replace live status with final clean report
         await ctx.telegram.editMessageText(chatId, messageId, undefined, result.summary, {
           reply_markup: KB.postExecution.reply_markup,
+        });
+      } else if (result.ineligibleOtherReferrer) {
+        await safeUpdateUser(userId, { current_step: 'failed' });
+        await ctx.telegram.editMessageText(chatId, messageId, undefined, OTHER_REFERRER_INELIGIBLE_MESSAGE, {
+          reply_markup: KB.start.reply_markup,
         });
       } else if (result.alreadyCompleted) {
         await safeUpdateUser(userId, { current_step: 'completed' });
