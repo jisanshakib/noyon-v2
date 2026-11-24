@@ -224,7 +224,7 @@ export function formatFastExecutionSummary(data: ExecutionSummaryInput): string 
   );
 
   if (data.claimAttempts != null && data.claimAttempts > 0) {
-    const cap = data.claimMaxAttempts ?? 20;
+    const cap = data.claimMaxAttempts ?? 50;
     const detail = data.claimStatusNote ? ` — ${data.claimStatusNote}` : '';
     lines.push(`• Referral Claim Attempts: ${data.claimAttempts}/${cap}${detail}`);
   }

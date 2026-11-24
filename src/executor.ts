@@ -20,12 +20,12 @@
 //
 // Retry Policy:
 //   1. Referral Reward Claim (Step E ONLY):
-//      - Retries up to a strict MAXIMUM of 20 attempts (`CLAIM_MAX_ATTEMPTS = 20`)
-//        until confirmed (`receipt.state === 'confirmed'` / `status === 1`), with
-//        brief backoff between attempts.
+//      - Retries up to a strict MAXIMUM of 50 attempts (`CLAIM_MAX_ATTEMPTS = 50`)
+//        until confirmed (`receipt.state === 'confirmed'` / `status === 1`) or
+//        verified settled via auto-payout/balance delta, using adaptive backoff.
 //      - Respects user cancel or expired wallet session immediately.
-//      - If all 20 attempts do not succeed, does NOT stall or crash — logs the
-//        attempt count and reason cleanly and proceeds to the final summary.
+//      - If all 50 attempts do not succeed, does NOT stall or crash — logs the
+//        attempt count (50/50) and reason cleanly and proceeds to the final summary.
 //   2. All Other Steps (Steps A, B, C, D):
 //      - Continuous retry until completed (`status === 1` confirmed on-chain),
 //        checking on-chain state before every retry to prevent double-execution.
@@ -93,23 +93,43 @@ function ensureStopPrefix(reason: string): string {
 }
 
 /** Strict retry cap applied ONLY to Step E (Referral Reward Claim). */
-export const CLAIM_MAX_ATTEMPTS = 20;
+export const CLAIM_MAX_ATTEMPTS = 50;
 
-const PREVIEW_TTL_MS       = 5 * 60 * 1000; // 5 minutes validity for a pending confirmation preview
-const RETRY_BASE_DELAY_MS  = 1_500;         // initial backoff for continuous step retries
-const RETRY_STEP_DELAY_MS  = 500;           // linear increment per retry attempt
-const RETRY_MAX_DELAY_MS   = 5_000;         // backoff cap for continuous retries
-const CLAIM_BASE_DELAY_MS  = 2_500;         // brief initial delay for referral claim retries
-const CLAIM_STEP_DELAY_MS  = 250;           // slight backoff ramp across up to 20 attempts
-const CLAIM_MAX_DELAY_MS   = 5_000;         // backoff cap for referral claim retries
-const STATUS_THROTTLE_MS   = 3_500;         // minimum interval between Telegram status message edits
+const PREVIEW_TTL_MS              = 5 * 60 * 1000; // 5 minutes validity for a pending confirmation preview
+const RETRY_BASE_DELAY_MS         = 1_500;         // initial backoff for continuous step retries
+const RETRY_STEP_DELAY_MS         = 500;           // linear increment per retry attempt
+const RETRY_MAX_DELAY_MS          = 5_000;         // backoff cap for continuous retries
+const CLAIM_BASE_DELAY_MS         = 1_800;         // short initial delay for referral claim retries
+const CLAIM_STEP_DELAY_MS         = 150;           // gentle ramp across normal polling attempts
+const CLAIM_NORMAL_MAX_DELAY_MS   = 4_500;         // normal polling delay cap
+const CLAIM_ERROR_BASE_DELAY_MS   = 3_000;         // elevated delay on rate limits / transient API errors
+const CLAIM_ERROR_STEP_DELAY_MS   = 300;           // ramp on repeated rate limits / transient errors
+const CLAIM_ERROR_MAX_DELAY_MS    = 6_000;         // max adaptive backoff cap (~6s)
+const STATUS_THROTTLE_MS          = 3_500;         // minimum interval between Telegram status message edits
 
 function computeRetryDelayMs(attempt: number): number {
   return Math.min(RETRY_MAX_DELAY_MS, RETRY_BASE_DELAY_MS + Math.max(0, attempt - 1) * RETRY_STEP_DELAY_MS);
 }
 
-function computeClaimDelayMs(attempt: number): number {
-  return Math.min(CLAIM_MAX_DELAY_MS, CLAIM_BASE_DELAY_MS + Math.max(0, attempt - 1) * CLAIM_STEP_DELAY_MS);
+/**
+ * Adaptive backoff for Step E referral claim retries (up to 50 attempts):
+ *   - Normal indexing/pending checks: ~1.8s stepping up gently to ~4.5s
+ *   - Rate limits (`too-soon` / HTTP 429) or transient API/RPC errors: ~3.0s up to ~6.0s
+ */
+export function computeClaimDelayMs(
+  attempt: number,
+  opts?: { rateLimited?: boolean; transientError?: boolean },
+): number {
+  if (opts?.rateLimited || opts?.transientError) {
+    return Math.min(
+      CLAIM_ERROR_MAX_DELAY_MS,
+      CLAIM_ERROR_BASE_DELAY_MS + Math.max(0, attempt - 1) * CLAIM_ERROR_STEP_DELAY_MS,
+    );
+  }
+  return Math.min(
+    CLAIM_NORMAL_MAX_DELAY_MS,
+    CLAIM_BASE_DELAY_MS + Math.max(0, attempt - 1) * CLAIM_STEP_DELAY_MS,
+  );
 }
 
 /** Keeps retry error snippets compact and readable in Telegram status edits. */
@@ -1489,13 +1509,16 @@ export async function runFullExecution(
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
-    // STEP E — Automatic Referral Reward Claim (STRICT MAX 20 ATTEMPTS CAP)
+    // STEP E — Automatic Referral Reward Claim (STRICT MAX 50 ATTEMPTS CAP)
     //
-    // Retries ONLY this step up to `CLAIM_MAX_ATTEMPTS` (20) times until the
-    // claim tx receipt is confirmed on-chain (`status === 1`).
-    // Respects user cancel or expired wallet session immediately.
-    // If all 20 attempts do not succeed, does NOT stall or crash — records the
-    // attempt count & note clearly and proceeds cleanly to the final summary.
+    // Retries ONLY this step up to `CLAIM_MAX_ATTEMPTS` (50) times until the
+    // claim tx receipt is confirmed on-chain (`status === 1`) or verified
+    // settled via auto-payout / balance delta.
+    // - Adaptive backoff (~1.8s–4.5s normal; ~3s–6s on rate limits / transient errors)
+    // - Polls any already-submitted `pendingClaimTxHash` before firing another claim
+    // - Respects user cancel or expired wallet session immediately
+    // - If all 50 attempts do not succeed, does NOT stall or crash — records
+    //   50/50 attempts and latest reason cleanly and proceeds to the final summary.
     // ═══════════════════════════════════════════════════════════════════════════
     await onStatus(`⚙️ Step E/E — Checking & claiming referral reward (max ${CLAIM_MAX_ATTEMPTS} attempts)…`);
 
@@ -1509,6 +1532,7 @@ export async function runFullExecution(
     let pendingClaimPaidUsdt: string | undefined;
     let initialPaidUsdt: number | null = null;
     const stepEStartedAt = Date.now();
+    const usdtBeforeClaim = await readUsdtBalance(walletAddress).catch(() => null);
 
     for (let attempt = 1; attempt <= CLAIM_MAX_ATTEMPTS; attempt++) {
       if (isCancelled(userId)) {
@@ -1517,7 +1541,7 @@ export async function runFullExecution(
         break;
       }
 
-      // Respect expired wallet session immediately during referral claim retries
+      // Respect expired/disconnected wallet session immediately during referral claim retries
       const sessionNow = await isSessionConnectedDb(userId).catch(() => ({ connected: true, address: walletAddress }));
       if (!sessionNow.connected) {
         lastClaimReason = `wallet session disconnected at attempt ${attempt}/${CLAIM_MAX_ATTEMPTS}`;
@@ -1526,10 +1550,12 @@ export async function runFullExecution(
       }
 
       claimAttempts = attempt;
+      let attemptRateLimited = false;
+      let attemptTransientError = false;
 
       try {
-        // If a previous attempt submitted a claim TX whose receipt timed out, check that TX first
-        // before querying pendingUsdt (since jager.live already deducted pendingUsdt on broadcast).
+        // 1. If a previous attempt already submitted a claim TX, poll its receipt first
+        //    so we never fire duplicate/conflicting claims or miss an in-flight confirmation.
         if (pendingClaimTxHash) {
           const prevRcpt = await pollTransactionReceipt(pendingClaimTxHash, {
             timeoutMs: 15_000,
@@ -1541,14 +1567,25 @@ export async function runFullExecution(
             claimConfirmed = true;
             claimTxHash = pendingClaimTxHash;
             txHashes.claim = pendingClaimTxHash;
-            inviteRewardUsdtStr = pendingClaimPaidUsdt;
-            if (inviteRewardUsdtStr) {
+            if (prevRcpt.usdtReceivedFromLogs > 0n) {
+              trackedInviteRewardWei = prevRcpt.usdtReceivedFromLogs;
+              inviteRewardUsdtStr = Number(ethers.formatUnits(prevRcpt.usdtReceivedFromLogs, TOKEN_DECIMALS)).toFixed(4);
+            } else if (pendingClaimPaidUsdt) {
+              inviteRewardUsdtStr = pendingClaimPaidUsdt;
               try {
                 trackedInviteRewardWei = ethers.parseUnits(inviteRewardUsdtStr, TOKEN_DECIMALS);
               } catch { /* ignore parse issue */ }
             }
             logger.info(
-              { userId, walletAddress, step: 'claim', attempt, maxAttempts: CLAIM_MAX_ATTEMPTS, claimTxHash },
+              {
+                userId,
+                walletAddress,
+                step: 'claim',
+                attempt,
+                maxAttempts: CLAIM_MAX_ATTEMPTS,
+                claimTxHash,
+                paidUsdt: inviteRewardUsdtStr ?? null,
+              },
               'Step E previously submitted referral claim TX confirmed on BSC',
             );
             break;
@@ -1562,9 +1599,16 @@ export async function runFullExecution(
             pendingClaimTxHash = '';
             pendingClaimPaidUsdt = undefined;
           } else {
-            lastClaimReason = `claim TX ${pendingClaimTxHash.slice(0, 12)}… still awaiting confirmation`;
+            lastClaimReason = `claim TX ${pendingClaimTxHash.slice(0, 12)}… still awaiting BSC confirmation`;
             if (attempt < CLAIM_MAX_ATTEMPTS) {
-              const delayMs = computeClaimDelayMs(attempt);
+              const delayMs = computeClaimDelayMs(attempt, { transientError: true });
+              const now = Date.now();
+              if (attempt <= 2 || now - lastClaimEditAt >= STATUS_THROTTLE_MS) {
+                lastClaimEditAt = now;
+                await onStatus(
+                  `⏳ Step E/E — Checking pending referral claim TX (${pendingClaimTxHash.slice(0, 10)}…, attempt ${attempt}/${CLAIM_MAX_ATTEMPTS})…`,
+                );
+              }
               if (await sleepWithCancelCheck(userId, delayMs)) {
                 lastClaimReason = `cancelled by user during referral claim retry (${attempt}/${CLAIM_MAX_ATTEMPTS})`;
                 break;
@@ -1574,77 +1618,83 @@ export async function runFullExecution(
           }
         }
 
+        // 2. Check current invite reward status before firing a claim
         const rewardStatus = await checkInviteRewards(walletAddress);
-        if (initialPaidUsdt === null) initialPaidUsdt = rewardStatus.paidUsdt;
-
-        // Detect if jager.live hourly auto-payout already settled this wallet while waiting
-        if (
-          rewardStatus.pendingUsdt === 0 &&
-          rewardStatus.recentPayoutForWallet &&
-          (rewardStatus.paidUsdt > initialPaidUsdt || rewardStatus.recentPayoutForWallet.at >= stepEStartedAt - 60_000)
-        ) {
-          const autoHash = rewardStatus.recentPayoutForWallet.hash;
-          const autoRcpt = await pollTransactionReceipt(autoHash, {
-            timeoutMs: 15_000,
-            pollIntervalMs: 1_500,
-            walletAddress,
-            isCancelled: () => isCancelled(userId),
-          });
-          if (autoRcpt.state === 'confirmed') {
-            claimConfirmed = true;
-            claimTxHash = autoHash;
-            txHashes.claim = autoHash;
-            inviteRewardUsdtStr = rewardStatus.recentPayoutForWallet.amountUsdt;
-            try {
-              trackedInviteRewardWei = ethers.parseUnits(inviteRewardUsdtStr, TOKEN_DECIMALS);
-            } catch { /* ignore */ }
-            logger.info(
-              { userId, walletAddress, step: 'claim', attempt, claimTxHash, paidUsdt: inviteRewardUsdtStr },
-              'Step E detected confirmed jager.live auto-payout referral reward',
-            );
-            break;
-          }
-        }
-
-        if (rewardStatus.rewardsPaused) {
-          lastClaimReason = 'invite rewards payouts paused on jager.live';
-          logger.info(
-            { userId, walletAddress, attempt, maxAttempts: CLAIM_MAX_ATTEMPTS, reason: lastClaimReason },
-            'Step E referral claim attempt — rewards paused',
+        if (!rewardStatus.ok) {
+          attemptRateLimited = Boolean(rewardStatus.rateLimited);
+          attemptTransientError = true;
+          lastClaimReason = rewardStatus.error ?? 'invite-rewards API temporarily unavailable';
+          logger.warn(
+            {
+              userId,
+              walletAddress,
+              attempt,
+              maxAttempts: CLAIM_MAX_ATTEMPTS,
+              httpStatus: rewardStatus.httpStatus ?? null,
+              rateLimited: attemptRateLimited,
+              err: lastClaimReason,
+            },
+            'Step E checkInviteRewards transient/rate-limit error — retrying with adaptive backoff',
           );
-        } else if (rewardStatus.pendingUsdt > 0) {
-          const now = Date.now();
-          if (attempt <= 2 || now - lastClaimEditAt >= STATUS_THROTTLE_MS) {
-            lastClaimEditAt = now;
-            await onStatus(
-              `🎁 Step E/E — Claiming ${rewardStatus.pendingUsdt} USDT referral reward (attempt ${attempt}/${CLAIM_MAX_ATTEMPTS})…`,
-            );
-          }
+        } else {
+          if (initialPaidUsdt === null) initialPaidUsdt = rewardStatus.paidUsdt;
 
-          const claimRes = await claimInviteRewards(walletAddress);
-          if (claimRes.claimed && claimRes.txHash) {
-            const candidateHash = claimRes.txHash;
-            const candidatePaid = claimRes.paidUsdt ?? rewardStatus.pendingUsdt.toFixed(4);
-            await onStatus(
-              `⏳ Step E/E — Referral claim TX submitted (${candidateHash.slice(0, 10)}…, attempt ${attempt}/${CLAIM_MAX_ATTEMPTS}). Waiting for receipt…`,
-            );
-
-            const claimReceipt = await pollTransactionReceipt(candidateHash, {
-              timeoutMs: 60_000,
+          // 2a. Detect confirmed auto-payout or prior-attempt settlement via `recent` list
+          if (
+            rewardStatus.pendingUsdt === 0 &&
+            rewardStatus.recentPayoutForWallet &&
+            (rewardStatus.paidUsdt > initialPaidUsdt || rewardStatus.recentPayoutForWallet.at >= stepEStartedAt - 120_000)
+          ) {
+            const autoHash = rewardStatus.recentPayoutForWallet.hash;
+            const autoRcpt = await pollTransactionReceipt(autoHash, {
+              timeoutMs: 15_000,
               pollIntervalMs: 1_500,
               walletAddress,
               isCancelled: () => isCancelled(userId),
             });
-
-            if (claimReceipt.state === 'confirmed') {
+            if (autoRcpt.state === 'confirmed') {
               claimConfirmed = true;
-              claimTxHash = candidateHash;
-              txHashes.claim = candidateHash;
-              inviteRewardUsdtStr = candidatePaid;
-              try {
-                trackedInviteRewardWei = ethers.parseUnits(inviteRewardUsdtStr, TOKEN_DECIMALS);
-              } catch { /* ignore parse issue */ }
+              claimTxHash = autoHash;
+              txHashes.claim = autoHash;
+              if (autoRcpt.usdtReceivedFromLogs > 0n) {
+                trackedInviteRewardWei = autoRcpt.usdtReceivedFromLogs;
+                inviteRewardUsdtStr = Number(ethers.formatUnits(autoRcpt.usdtReceivedFromLogs, TOKEN_DECIMALS)).toFixed(4);
+              } else {
+                inviteRewardUsdtStr = rewardStatus.recentPayoutForWallet.amountUsdt;
+                try {
+                  trackedInviteRewardWei = ethers.parseUnits(inviteRewardUsdtStr, TOKEN_DECIMALS);
+                } catch { /* ignore */ }
+              }
+              logger.info(
+                { userId, walletAddress, step: 'claim', attempt, maxAttempts: CLAIM_MAX_ATTEMPTS, claimTxHash, paidUsdt: inviteRewardUsdtStr },
+                'Step E detected confirmed jager.live auto-payout / settled referral reward',
+              );
+              break;
+            }
+            if (autoRcpt.state === 'timeout') {
+              // Track this in-flight payout TX hash so next attempt polls it instead of double-claiming
+              pendingClaimTxHash = autoHash;
+              pendingClaimPaidUsdt = rewardStatus.recentPayoutForWallet.amountUsdt;
+              lastClaimReason = `detected in-flight payout TX ${autoHash.slice(0, 12)}… awaiting confirmation`;
+            }
+          }
 
+          // 2b. Fallback settlement detection: paidUsdt increased + on-chain USDT balance increased
+          if (
+            !claimConfirmed &&
+            !pendingClaimTxHash &&
+            rewardStatus.pendingUsdt === 0 &&
+            rewardStatus.paidUsdt > initialPaidUsdt &&
+            usdtBeforeClaim !== null
+          ) {
+            const usdtNow = await readUsdtBalance(walletAddress).catch(() => usdtBeforeClaim);
+            const deltaWei = usdtNow > usdtBeforeClaim ? usdtNow - usdtBeforeClaim : 0n;
+            if (deltaWei > 0n) {
+              claimConfirmed = true;
+              claimTxHash = 'settled-onchain (auto-payout)';
+              txHashes.claim = claimTxHash;
+              trackedInviteRewardWei = deltaWei;
+              inviteRewardUsdtStr = Number(ethers.formatUnits(deltaWei, TOKEN_DECIMALS)).toFixed(4);
               logger.info(
                 {
                   userId,
@@ -1652,45 +1702,119 @@ export async function runFullExecution(
                   step: 'claim',
                   attempt,
                   maxAttempts: CLAIM_MAX_ATTEMPTS,
-                  claimTxHash,
-                  paidUsdt: inviteRewardUsdtStr,
-                  blockNumber: claimReceipt.receipt.blockNumber,
+                  paidUsdtDelta: rewardStatus.paidUsdt - initialPaidUsdt,
+                  onChainUsdtDelta: inviteRewardUsdtStr,
                 },
-                'Step E referral reward claim confirmed on BSC',
+                'Step E verified referral reward settled on-chain via paidUsdt + USDT balance delta',
               );
               break;
             }
+          }
 
-            if (claimReceipt.state === 'cancelled') {
-              lastClaimReason = `cancelled while waiting for claim TX ${candidateHash.slice(0, 12)}… (attempt ${attempt}/${CLAIM_MAX_ATTEMPTS})`;
-              break;
+          if (rewardStatus.rewardsPaused) {
+            lastClaimReason = 'invite rewards payouts paused on jager.live';
+            logger.info(
+              { userId, walletAddress, attempt, maxAttempts: CLAIM_MAX_ATTEMPTS, reason: lastClaimReason },
+              'Step E referral claim attempt — rewards paused',
+            );
+          } else if (rewardStatus.pendingUsdt > 0) {
+            const now = Date.now();
+            if (attempt <= 2 || now - lastClaimEditAt >= STATUS_THROTTLE_MS) {
+              lastClaimEditAt = now;
+              await onStatus(
+                `🎁 Step E/E — Claiming ${rewardStatus.pendingUsdt} USDT referral reward (attempt ${attempt}/${CLAIM_MAX_ATTEMPTS})…`,
+              );
             }
 
-            if (claimReceipt.state === 'timeout') {
-              // Preserve txHash so the next attempt checks this receipt instead of losing it
+            const claimRes = await claimInviteRewards(walletAddress);
+            if (claimRes.claimed && claimRes.txHash) {
+              const candidateHash = claimRes.txHash;
+              const candidatePaid = claimRes.paidUsdt ?? rewardStatus.pendingUsdt.toFixed(4);
               pendingClaimTxHash = candidateHash;
               pendingClaimPaidUsdt = candidatePaid;
-              lastClaimReason = `claim TX ${candidateHash.slice(0, 12)}… receipt timed out`;
+
+              await onStatus(
+                `⏳ Step E/E — Referral claim TX submitted (${candidateHash.slice(0, 10)}…, attempt ${attempt}/${CLAIM_MAX_ATTEMPTS}). Waiting for receipt…`,
+              );
+
+              const claimReceipt = await pollTransactionReceipt(candidateHash, {
+                timeoutMs: 45_000,
+                pollIntervalMs: 1_500,
+                walletAddress,
+                isCancelled: () => isCancelled(userId),
+              });
+
+              if (claimReceipt.state === 'confirmed') {
+                claimConfirmed = true;
+                claimTxHash = candidateHash;
+                txHashes.claim = candidateHash;
+                if (claimReceipt.usdtReceivedFromLogs > 0n) {
+                  trackedInviteRewardWei = claimReceipt.usdtReceivedFromLogs;
+                  inviteRewardUsdtStr = Number(ethers.formatUnits(claimReceipt.usdtReceivedFromLogs, TOKEN_DECIMALS)).toFixed(4);
+                } else {
+                  inviteRewardUsdtStr = candidatePaid;
+                  try {
+                    trackedInviteRewardWei = ethers.parseUnits(inviteRewardUsdtStr, TOKEN_DECIMALS);
+                  } catch { /* ignore parse issue */ }
+                }
+
+                logger.info(
+                  {
+                    userId,
+                    walletAddress,
+                    step: 'claim',
+                    attempt,
+                    maxAttempts: CLAIM_MAX_ATTEMPTS,
+                    claimTxHash,
+                    paidUsdt: inviteRewardUsdtStr,
+                    blockNumber: claimReceipt.receipt.blockNumber,
+                  },
+                  'Step E referral reward claim confirmed on BSC',
+                );
+                break;
+              }
+
+              if (claimReceipt.state === 'cancelled') {
+                lastClaimReason = `cancelled while waiting for claim TX ${candidateHash.slice(0, 12)}… (attempt ${attempt}/${CLAIM_MAX_ATTEMPTS})`;
+                break;
+              }
+
+              if (claimReceipt.state === 'timeout') {
+                // Keep pendingClaimTxHash set so the next attempt polls this receipt rather than double-claiming
+                lastClaimReason = `claim TX ${candidateHash.slice(0, 12)}… receipt timed out (will re-poll)`;
+              } else {
+                pendingClaimTxHash = '';
+                pendingClaimPaidUsdt = undefined;
+                lastClaimReason = `claim TX ${candidateHash.slice(0, 12)}… reverted on-chain (status=0)`;
+              }
+              logger.warn(
+                { userId, walletAddress, attempt, maxAttempts: CLAIM_MAX_ATTEMPTS, candidateHash, state: claimReceipt.state },
+                'Step E referral claim TX did not confirm — retrying within 50-attempt cap',
+              );
             } else {
-              lastClaimReason = `claim TX ${candidateHash.slice(0, 12)}… reverted on-chain (status=0)`;
+              attemptRateLimited = Boolean(claimRes.rateLimited || claimRes.isPendingInFlight);
+              lastClaimReason = claimRes.reason ?? 'claim endpoint returned not claimed';
+              logger.info(
+                {
+                  userId,
+                  walletAddress,
+                  attempt,
+                  maxAttempts: CLAIM_MAX_ATTEMPTS,
+                  pendingUsdt: rewardStatus.pendingUsdt,
+                  rateLimited: attemptRateLimited,
+                  isPendingInFlight: Boolean(claimRes.isPendingInFlight),
+                  reason: lastClaimReason,
+                },
+                'Step E referral claim attempt did not succeed — retrying within 50-attempt cap',
+              );
             }
-            logger.warn(
-              { userId, walletAddress, attempt, maxAttempts: CLAIM_MAX_ATTEMPTS, candidateHash, state: claimReceipt.state },
-              'Step E referral claim TX did not confirm — retrying within 20-attempt cap',
-            );
           } else {
-            lastClaimReason = claimRes.reason ?? 'claim endpoint returned not claimed';
+            lastClaimReason = 'no pending referral reward credited yet';
             logger.info(
-              { userId, walletAddress, attempt, maxAttempts: CLAIM_MAX_ATTEMPTS, pendingUsdt: rewardStatus.pendingUsdt, reason: lastClaimReason },
-              'Step E referral claim attempt did not succeed — retrying within 20-attempt cap',
+              { userId, walletAddress, attempt, maxAttempts: CLAIM_MAX_ATTEMPTS, pendingUsdt: rewardStatus.pendingUsdt },
+              'Step E referral claim check — pendingUsdt is 0, waiting for indexer within 50-attempt cap',
             );
           }
-        } else {
-          lastClaimReason = 'no pending referral reward credited yet';
-          logger.info(
-            { userId, walletAddress, attempt, maxAttempts: CLAIM_MAX_ATTEMPTS, pendingUsdt: rewardStatus.pendingUsdt },
-            'Step E referral claim check — pendingUsdt is 0, waiting for indexer within 20-attempt cap',
-          );
         }
       } catch (claimErr) {
         const e = claimErr as Error & { isSessionExpired?: boolean };
@@ -1699,15 +1823,20 @@ export async function runFullExecution(
           logger.warn({ userId, walletAddress, attempt }, 'Step E referral claim aborted — session expired');
           break;
         }
+        attemptTransientError = true;
+        attemptRateLimited = /429|rate.?limit|too.?many/i.test(String(e?.message ?? ''));
         lastClaimReason = summarizeRetryError(claimErr);
         logger.warn(
           { userId, walletAddress, attempt, maxAttempts: CLAIM_MAX_ATTEMPTS, err: lastClaimReason },
-          'Step E referral claim attempt threw error — retrying within 20-attempt cap',
+          'Step E referral claim attempt threw error — retrying within 50-attempt cap',
         );
       }
 
       if (attempt < CLAIM_MAX_ATTEMPTS) {
-        const delayMs = computeClaimDelayMs(attempt);
+        const delayMs = computeClaimDelayMs(attempt, {
+          rateLimited: attemptRateLimited,
+          transientError: attemptTransientError,
+        });
         const now = Date.now();
         if (attempt <= 2 || now - lastClaimEditAt >= STATUS_THROTTLE_MS) {
           lastClaimEditAt = now;

@@ -312,6 +312,10 @@ export async function fetchJagerAgentStatus(rawWalletAddress: string): Promise<J
 }
 
 export interface InviteRewardsStatus {
+  ok: boolean;
+  httpStatus?: number;
+  rateLimited?: boolean;
+  error?: string;
   pendingUsdt: number;
   paidUsdt: number;
   rewardsPaused: boolean;
@@ -330,36 +334,59 @@ export async function checkInviteRewards(rawWalletAddress: string): Promise<Invi
       signal: AbortSignal.timeout(15_000),
     });
     if (!res.ok) {
-      return { pendingUsdt: 0, paidUsdt: 0, rewardsPaused: false, recentPayoutForWallet: null };
+      const rateLimited = res.status === 429;
+      return {
+        ok: false,
+        httpStatus: res.status,
+        rateLimited,
+        error: rateLimited ? 'HTTP 429 rate-limited by jager.live' : `HTTP ${res.status} from jager.live/api/invite-rewards`,
+        pendingUsdt: 0,
+        paidUsdt: 0,
+        rewardsPaused: false,
+        recentPayoutForWallet: null,
+      };
     }
     const raw = (await res.json()) as Record<string, unknown>;
     const you = (raw.you && typeof raw.you === 'object' ? raw.you : {}) as Record<string, unknown>;
 
+    // Pick the newest recent payout matching this wallet (largest `at` timestamp)
     let recentPayoutForWallet: { hash: string; amountUsdt: string; at: number } | null = null;
     if (Array.isArray(raw.recent)) {
       for (const item of raw.recent as Array<Record<string, unknown>>) {
         const to = typeof item?.to === 'string' ? item.to.toLowerCase() : '';
         const hash = typeof item?.hash === 'string' ? item.hash : '';
+        const at = Number(item?.at ?? 0);
         if (to === walletLower && /^0x[0-9a-fA-F]{64}$/.test(hash)) {
-          recentPayoutForWallet = {
-            hash,
-            amountUsdt: item.n != null ? String(item.n) : '0',
-            at: Number(item.at ?? 0),
-          };
-          break;
+          if (!recentPayoutForWallet || at >= recentPayoutForWallet.at) {
+            recentPayoutForWallet = {
+              hash,
+              amountUsdt: item.n != null ? String(item.n) : '0',
+              at: Number.isFinite(at) ? at : 0,
+            };
+          }
         }
       }
     }
 
     return {
+      ok: true,
+      httpStatus: res.status,
       pendingUsdt: Number.isFinite(Number(you.pending)) ? Number(you.pending) : 0,
       paidUsdt: Number.isFinite(Number(you.paid)) ? Number(you.paid) : 0,
       rewardsPaused: raw.rewardsPaused === true || raw.paused === true,
       recentPayoutForWallet,
     };
   } catch (err) {
-    logger.warn({ err: (err as Error)?.message }, 'checkInviteRewards failed (non-fatal)');
-    return { pendingUsdt: 0, paidUsdt: 0, rewardsPaused: false, recentPayoutForWallet: null };
+    const msg = (err as Error)?.message ?? String(err);
+    logger.warn({ err: msg }, 'checkInviteRewards request error (transient)');
+    return {
+      ok: false,
+      error: msg,
+      pendingUsdt: 0,
+      paidUsdt: 0,
+      rewardsPaused: false,
+      recentPayoutForWallet: null,
+    };
   }
 }
 
@@ -368,6 +395,8 @@ export interface InviteRewardClaimResult {
   paidUsdt?: string;
   txHash?: string;
   reason?: string;
+  rateLimited?: boolean;
+  isPendingInFlight?: boolean;
 }
 
 /**
@@ -397,11 +426,13 @@ export async function claimInviteRewards(rawWalletAddress: string): Promise<Invi
     }
 
     const reason = String(raw.reason ?? raw.error ?? `HTTP ${res.status}`);
-    return { claimed: false, reason };
+    const rateLimited = res.status === 429 || /too-soon|rate.?limit|429/i.test(reason);
+    const isPendingInFlight = /too-soon|busy|pending/i.test(reason);
+    return { claimed: false, reason, rateLimited, isPendingInFlight };
   } catch (err) {
     const msg = (err as Error)?.message ?? String(err);
     logger.warn({ err: msg }, 'claimInviteRewards request failed');
-    return { claimed: false, reason: msg };
+    return { claimed: false, reason: msg, rateLimited: /429|rate.?limit/i.test(msg) };
   }
 }
 
