@@ -4,7 +4,7 @@
 import { Context } from 'telegraf';
 import { cancelUser } from '../db.js';
 import { clearSession } from '../wallet.js';
-import { isUserLocked, requestCancelExecution } from '../executor.js';
+import { isUserLocked, requestCancelExecution, clearPendingPreview } from '../executor.js';
 import { KB } from '../keyboards.js';
 import { logger } from '../logger.js';
 
@@ -24,6 +24,7 @@ export async function handleCancel(ctx: Context): Promise<void> {
 
   await safeAnswerCb(ctx, 'Cancelling…');
 
+  clearPendingPreview(userId);
   const wasRunning = isUserLocked(userId);
   if (wasRunning) {
     requestCancelExecution(userId);
@@ -31,9 +32,14 @@ export async function handleCancel(ctx: Context): Promise<void> {
 
   try {
     await cancelUser(userId);
+  } catch (err) {
+    logger.error({ err, userId }, 'handleCancel: DB cancel failed (continuing session cleanup)');
+  }
+
+  try {
     await clearSession(userId);
   } catch (err) {
-    logger.error({ err, userId }, 'handleCancel: DB cancel failed');
+    logger.error({ err, userId }, 'handleCancel: clearSession failed');
   }
 
   const msg = wasRunning

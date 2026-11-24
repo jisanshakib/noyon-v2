@@ -51,6 +51,12 @@ export const KB = {
     [Markup.button.callback('❌ Cancel', 'cancel')],
   ]),
 
+  /** Shown on the single combined JAGER full-cycle preview (ONE confirmation) */
+  confirmCycle: Markup.inlineKeyboard([
+    [Markup.button.callback('✅ Confirm & Execute Full Cycle', 'confirm_execute_cycle')],
+    [Markup.button.callback('❌ Cancel', 'cancel_preview')],
+  ]),
+
   /** Shown when execution is running (single cancel button) */
   cancelOnly: Markup.inlineKeyboard([
     [Markup.button.callback('❌ Cancel Job', 'cancel')],

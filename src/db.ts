@@ -112,18 +112,24 @@ export async function initDb(): Promise<void> {
 
     await client.query(`
       CREATE TABLE IF NOT EXISTS executions (
-        id               BIGSERIAL PRIMARY KEY,
-        telegram_user_id BIGINT NOT NULL REFERENCES users(telegram_user_id) ON DELETE CASCADE,
-        wallet_address   TEXT,
-        agent_id_name    TEXT,
-        status           TEXT NOT NULL,
-        mint_cost_bnb    NUMERIC,
-        tokens_received  NUMERIC,
-        sell_bnb         NUMERIC,
-        pnl_or_fee       NUMERIC,
-        tx_hashes        JSONB,
-        summary          TEXT,
-        created_at       TIMESTAMPTZ NOT NULL DEFAULT now()
+        id                 BIGSERIAL PRIMARY KEY,
+        telegram_user_id   BIGINT NOT NULL REFERENCES users(telegram_user_id) ON DELETE CASCADE,
+        wallet_address     TEXT,
+        agent_id_name      TEXT,
+        mint_contract      TEXT,
+        status             TEXT NOT NULL,
+        currency           TEXT NOT NULL DEFAULT 'USDT',
+        mint_cost_bnb      NUMERIC,
+        mint_cost_usdt     NUMERIC,
+        tokens_received    NUMERIC,
+        sell_bnb           NUMERIC,
+        sell_usdt          NUMERIC,
+        pnl_or_fee         NUMERIC,
+        pnl_or_fee_usdt    NUMERIC,
+        invite_reward_usdt NUMERIC,
+        tx_hashes          JSONB,
+        summary            TEXT,
+        created_at         TIMESTAMPTZ NOT NULL DEFAULT now()
       );
     `);
 
@@ -133,6 +139,12 @@ export async function initDb(): Promise<void> {
     await client.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS wallet_address TEXT`);
     await client.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS agent_id_name TEXT`);
     await client.query(`ALTER TABLE executions ADD COLUMN IF NOT EXISTS wallet_address TEXT`);
+    await client.query(`ALTER TABLE executions ADD COLUMN IF NOT EXISTS mint_contract TEXT`);
+    await client.query(`ALTER TABLE executions ADD COLUMN IF NOT EXISTS currency TEXT NOT NULL DEFAULT 'BNB'`);
+    await client.query(`ALTER TABLE executions ADD COLUMN IF NOT EXISTS mint_cost_usdt NUMERIC`);
+    await client.query(`ALTER TABLE executions ADD COLUMN IF NOT EXISTS sell_usdt NUMERIC`);
+    await client.query(`ALTER TABLE executions ADD COLUMN IF NOT EXISTS pnl_or_fee_usdt NUMERIC`);
+    await client.query(`ALTER TABLE executions ADD COLUMN IF NOT EXISTS invite_reward_usdt NUMERIC`);
 
     // Durable key-value settings (e.g. admin-only bot_paused flag)
     await client.query(`
@@ -142,6 +154,18 @@ export async function initDb(): Promise<void> {
         updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
       );
     `);
+
+    // Ensure indexes exist even when schema.sql was not applied manually
+    await client.query(`CREATE INDEX IF NOT EXISTS idx_users_last_active ON users (last_active_at DESC)`);
+    await client.query(`CREATE INDEX IF NOT EXISTS idx_users_completed   ON users (completed_count DESC) WHERE completed_count > 0`);
+    await client.query(`CREATE INDEX IF NOT EXISTS idx_users_connected   ON users (is_wallet_connected) WHERE is_wallet_connected = TRUE`);
+    await client.query(`CREATE INDEX IF NOT EXISTS idx_users_agent_id    ON users (agent_id_name) WHERE agent_id_name IS NOT NULL`);
+    await client.query(`CREATE INDEX IF NOT EXISTS idx_executions_user   ON executions (telegram_user_id, created_at DESC)`);
+    await client.query(`CREATE INDEX IF NOT EXISTS idx_executions_status ON executions (status)`);
+    await client.query(`CREATE INDEX IF NOT EXISTS idx_executions_agent  ON executions (agent_id_name) WHERE agent_id_name IS NOT NULL`);
+    await client.query(`CREATE INDEX IF NOT EXISTS idx_executions_completed_agent    ON executions (LOWER(agent_id_name)) WHERE status = 'COMPLETED' AND agent_id_name IS NOT NULL`);
+    await client.query(`CREATE INDEX IF NOT EXISTS idx_executions_completed_addr     ON executions (LOWER(wallet_address)) WHERE status = 'COMPLETED' AND wallet_address IS NOT NULL`);
+    await client.query(`CREATE INDEX IF NOT EXISTS idx_executions_completed_contract ON executions (LOWER(mint_contract)) WHERE status = 'COMPLETED' AND mint_contract IS NOT NULL`);
 
     // Load persisted bot_paused state so admin stop/start survives restarts
     const pauseRes = await client.query<{ value: string }>(
@@ -251,7 +275,13 @@ export async function safeUpdateUser(
 
 export async function cancelUser(userId: number): Promise<void> {
   await pool.query(
-    `UPDATE users SET is_cancelled = TRUE, current_step = 'cancelled', last_active_at = now()
+    `UPDATE users
+     SET is_cancelled        = TRUE,
+         is_wallet_connected = FALSE,
+         session_link        = NULL,
+         qr_generated        = FALSE,
+         current_step        = 'cancelled',
+         last_active_at      = now()
      WHERE telegram_user_id = $1`,
     [userId],
   );
@@ -265,11 +295,17 @@ export interface DbExecution {
   telegram_user_id: number;
   wallet_address?: string | null;
   agent_id_name: string | null;
+  mint_contract?: string | null;
   status: string;
+  currency?: string | null;
   mint_cost_bnb: string | null;
+  mint_cost_usdt?: string | null;
   tokens_received: string | null;
   sell_bnb: string | null;
+  sell_usdt?: string | null;
   pnl_or_fee: string | null;
+  pnl_or_fee_usdt?: string | null;
+  invite_reward_usdt?: string | null;
   tx_hashes: Record<string, string> | null;
   summary: string | null;
   created_at: Date;
@@ -280,19 +316,27 @@ export async function insertExecution(
 ): Promise<number> {
   const { rows } = await pool.query<{ id: number }>(
     `INSERT INTO executions
-       (telegram_user_id, wallet_address, agent_id_name, status, mint_cost_bnb, tokens_received,
-        sell_bnb, pnl_or_fee, tx_hashes, summary)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+       (telegram_user_id, wallet_address, agent_id_name, mint_contract, status, currency,
+        mint_cost_bnb, mint_cost_usdt, tokens_received,
+        sell_bnb, sell_usdt, pnl_or_fee, pnl_or_fee_usdt, invite_reward_usdt,
+        tx_hashes, summary)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
      RETURNING id`,
     [
       data.telegram_user_id,
       data.wallet_address ?? null,
       data.agent_id_name,
+      data.mint_contract ?? null,
       data.status,
+      data.currency ?? 'USDT',
       data.mint_cost_bnb,
+      data.mint_cost_usdt ?? null,
       data.tokens_received,
       data.sell_bnb,
+      data.sell_usdt ?? null,
       data.pnl_or_fee,
+      data.pnl_or_fee_usdt ?? null,
+      data.invite_reward_usdt ?? null,
       data.tx_hashes ? JSON.stringify(data.tx_hashes) : null,
       data.summary,
     ],
@@ -301,22 +345,29 @@ export async function insertExecution(
   return rows[0].id;
 }
 
-// ─── One-time completed Agent ID / Wallet lock (DB-authoritative + memory fallback) ─
-// Strictly keyed by normalized agentIdName (*.ai) and/or walletAddress — NEVER by
-// telegram_user_id, so one Telegram user can freely run multiple cycles across
-// different Agent IDs or different Agent Wallets.
+// ─── One-time completed Agent ID / Wallet lock scoped strictly to current JAGER Mint Contract ─
+// Keyed by (mintContract, normalized agentIdName) and/or (mintContract, normalized walletAddress)
+// — NEVER by telegram_user_id (so one Telegram user can run fresh .ai IDs/wallets) and
+// — NEVER matching legacy SPACE ID / BNB rows (`currency = 'BNB'`) so old records do not block JAGER.
 
 const completedAgentIdsMem = new Set<string>();
 const completedWalletsMem  = new Set<string>();
 
+function contractScopedKey(mintContract: string, value: string): string {
+  return `${mintContract.trim().toLowerCase()}:${value.trim().toLowerCase()}`;
+}
+
 export function recordCompletedAgentInMemory(opts: {
+  mintContract: string;
   agentIdName?: string | null;
   walletAddress?: string | null;
 }): void {
+  const contract = opts.mintContract.trim().toLowerCase();
+  if (!contract) return;
   const agent = opts.agentIdName?.trim().toLowerCase();
-  if (agent) completedAgentIdsMem.add(agent);
+  if (agent) completedAgentIdsMem.add(contractScopedKey(contract, agent));
   const wallet = opts.walletAddress?.trim().toLowerCase();
-  if (wallet) completedWalletsMem.add(wallet);
+  if (wallet) completedWalletsMem.add(contractScopedKey(contract, wallet));
 }
 
 export interface CompletedAgentCheckResult {
@@ -325,36 +376,39 @@ export interface CompletedAgentCheckResult {
 }
 
 /**
- * Checks whether a full cycle (sell confirmed / status = 'COMPLETED') has
- * already finished for this Agent ID (`agentIdName`, e.g. `*.ai`) and/or
- * Agent Wallet (`walletAddress`).
+ * Checks whether a full JAGER cycle (`status = 'COMPLETED'` with confirmed sell
+ * for the target `mintContract`) has already finished for this `.ai` Agent ID
+ * and/or BSC wallet address.
  *
- * Strictly ignores Telegram `userId` (allowing one Telegram account to run
- * different Agent IDs / wallets) and strictly ignores CANCELLED, STOPPED,
- * FAILED, or incomplete mint-only rows so unfinished runs can resume cleanly.
+ * Strictly ignores:
+ *   - Telegram `userId` (allowing one Telegram user to run multiple distinct fresh .ai wallets)
+ *   - Legacy SPACE ID / BNB executions (`currency = 'BNB'` / different `mint_contract`)
+ *   - Non-completed runs (`STOPPED`, `FAILED`, `CANCELLED`)
  */
 export async function hasCompletedCycleForAgent(opts: {
+  mintContract: string;
   agentIdName?: string | null;
   walletAddress?: string | null;
 }): Promise<CompletedAgentCheckResult> {
-  const agent  = opts.agentIdName?.trim().toLowerCase() || null;
-  const wallet = opts.walletAddress?.trim().toLowerCase() || null;
+  const contract = opts.mintContract.trim().toLowerCase();
+  const agent    = opts.agentIdName?.trim().toLowerCase() || null;
+  const wallet   = opts.walletAddress?.trim().toLowerCase() || null;
 
-  if (!agent && !wallet) {
+  if (!contract || (!agent && !wallet)) {
     return { completed: false };
   }
 
-  // Fast in-memory check (also protects when DB is temporarily degraded)
-  if (agent && completedAgentIdsMem.has(agent)) {
+  // Fast contract-scoped in-memory check
+  if (agent && completedAgentIdsMem.has(contractScopedKey(contract, agent))) {
     return { completed: true, matchedBy: 'agent_id' };
   }
-  if (wallet && completedWalletsMem.has(wallet)) {
+  if (wallet && completedWalletsMem.has(contractScopedKey(contract, wallet))) {
     return { completed: true, matchedBy: 'wallet_address' };
   }
 
   try {
-    // Check genuinely completed execution records (status = 'COMPLETED' with confirmed sell)
-    // strictly matching e.agent_id_name or e.wallet_address (never telegram_user_id).
+    // Strictly match COMPLETED JAGER executions for this mint_contract
+    // (also covers pre-migration JAGER USDT rows where mint_contract was NULL and currency = 'USDT').
     const { rows } = await pool.query<{
       matched_agent: boolean;
       matched_wallet: boolean;
@@ -371,29 +425,33 @@ export async function hasCompletedCycleForAgent(opts: {
        WHERE e.status = 'COMPLETED'
          AND COALESCE(e.tx_hashes->>'sell', '') <> ''
          AND (
+           LOWER(COALESCE(e.mint_contract, '')) = $3
+           OR (e.mint_contract IS NULL AND UPPER(COALESCE(e.currency, '')) = 'USDT')
+         )
+         AND (
            ($1::text IS NOT NULL AND LOWER(COALESCE(e.agent_id_name, '')) = $1)
            OR ($2::text IS NOT NULL AND (
                 LOWER(COALESCE(e.wallet_address, '')) = $2 OR
                 LOWER(COALESCE(e.agent_id_name, '')) = $2
               ))
          )`,
-      [agent, wallet],
+      [agent, wallet, contract],
     );
     dbReady = true;
 
     const r = rows[0];
     if (r?.matched_agent) {
-      recordCompletedAgentInMemory({ agentIdName: agent });
+      recordCompletedAgentInMemory({ mintContract: contract, agentIdName: agent });
       return { completed: true, matchedBy: 'agent_id' };
     }
     if (r?.matched_wallet) {
-      recordCompletedAgentInMemory({ walletAddress: wallet });
+      recordCompletedAgentInMemory({ mintContract: contract, walletAddress: wallet });
       return { completed: true, matchedBy: 'wallet_address' };
     }
 
     return { completed: false };
   } catch (err) {
-    logger.warn({ err, agent, wallet }, 'hasCompletedCycleForAgent: DB check failed (using in-memory state)');
+    logger.warn({ err, contract, agent, wallet }, 'hasCompletedCycleForAgent: DB check failed (using in-memory state)');
     return { completed: false };
   }
 }
@@ -407,38 +465,6 @@ export async function getUserExecutions(
   );
   dbReady = true;
   return rows;
-}
-
-/**
- * Returns the latest non-completed execution for a user where a mint TX was
- * already broadcast (`tx_hashes->>'mint'` present) but `sell` never completed.
- * Used to resume Approve → Sell instead of blindly re-minting.
- */
-export async function getLatestUnfinishedMint(
-  userId: number,
-  walletAddress?: string | null,
-): Promise<DbExecution | null> {
-  const wallet = walletAddress?.trim().toLowerCase() || null;
-  try {
-    const { rows } = await pool.query<DbExecution>(
-      `SELECT *
-       FROM executions
-       WHERE telegram_user_id = $1
-         AND status <> 'COMPLETED'
-         AND tx_hashes IS NOT NULL
-         AND tx_hashes->>'mint' IS NOT NULL
-         AND tx_hashes->>'sell' IS NULL
-         AND ($2::text IS NULL OR wallet_address IS NULL OR LOWER(wallet_address) = $2)
-       ORDER BY created_at DESC
-       LIMIT 1`,
-      [userId, wallet],
-    );
-    dbReady = true;
-    return rows[0] ?? null;
-  } catch (err) {
-    logger.warn({ err, userId }, 'getLatestUnfinishedMint failed (continuing with on-chain check)');
-    return null;
-  }
 }
 
 // ─── Admin helpers (NEVER expose to non-admin handlers) ──────────────────────

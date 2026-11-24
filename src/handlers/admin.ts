@@ -122,7 +122,7 @@ export async function handleAdminOverview(ctx: Context): Promise<void> {
       `  • Connected only (0 completed): ${stats.connectedOnlyUsersCount}`,
       `  • Connected / Incomplete / Failed: ${stats.incompleteUsersCount}`,
       ``,
-      `📈 Full Cycles (mint + approve + sell):`,
+      `📈 Full Cycles (JAGER One-Confirm):`,
       `  • Total completed runs: ${stats.completedCyclesTotal}`,
       `  • Unique completed Agent IDs: ${stats.uniqueCompletedAgentIds.length}`,
       ``,
@@ -179,7 +179,7 @@ export async function handleAdminCompleted(ctx: Context): Promise<void> {
     });
 
     const header = [
-      `🏆 Completed Full Cycles (mint + approve + sell)`,
+      `🏆 Completed Full Cycles (JAGER One-Confirm)`,
       ``,
       `• Completed Users: ${users.length}`,
       `• Unique Completed Agent IDs: ${allCompletedAgents.size}`,

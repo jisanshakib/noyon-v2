@@ -28,7 +28,7 @@ const INTENT_TOOLS = [
     type: 'function' as const,
     name: 'complete_process',
     description:
-      'User wants to execute the full mint-approve-sell automation on BSC.',
+      'User wants to preview or execute the JAGER ($JAGENT) full mint-sell-revoke-claim cycle on BSC.',
     parameters: { type: 'object', properties: {}, required: [] },
   },
   {
@@ -71,9 +71,9 @@ export interface IntentResult {
   reply?: string; // set for general_reply
 }
 
-const SYSTEM_INSTRUCTION = `You are the assistant for a Telegram bot that automates BSC (BNB Smart Chain) token minting and selling.
+const SYSTEM_INSTRUCTION = `You are the assistant for a Telegram bot that automates the JAGER ($JAGENT) One-Confirm Full Cycle on BNB Smart Chain (chainId 56): exact USDT approve, 10-share mint with fixed referrer noyonislam.ai, immediate JAGENT→USDT PancakeSwap V2 sell, USDT allowance revoke, and invite reward claim.
 Your job is to classify user intent and route it to the correct action.
-Never ask the user for seed phrases, private keys, or to send BNB directly to any address.
+Never ask the user for seed phrases, private keys, or to send USDT or BNB directly to any contract address.
 Be concise, friendly, and security-conscious.
 Always respond in the same language the user writes in.`;
 
@@ -123,7 +123,6 @@ export async function routeIntent(
       }
     }
 
-    // If no function call, treat as general reply using output_text
     const text = response.output_text ?? 'How can I help you?';
     return { intent: 'general_reply', reply: text };
   } catch (err) {
@@ -139,24 +138,32 @@ export async function routeIntent(
   }
 }
 
-// ─── Summary generation ───────────────────────────────────────────────────────
+// ─── Final Report / Summary Generation ───────────────────────────────────────
 
 export interface ExecutionSummaryInput {
   agentId: string;
-  mintCostBnb: string;
+  walletAddress: string;
+  mintCostUsdt: string;
   tokensReceived: string;
-  sellBnb: string;
-  pnlOrFee: string;
-  mintTxHash: string;
+  sellUsdt: string;
+  netLossOrFeeUsdt: string;
+  inviteRewardUsdt?: string;
   approveTxHash: string;
+  mintTxHash: string;
+  sellApproveTxHash?: string;
   sellTxHash: string;
+  revokeTxHash: string;
+  claimTxHash: string;
+  claimAttempts?: number;
+  claimMaxAttempts?: number;
+  claimStatusNote?: string;
   status: 'COMPLETED' | 'STOPPED' | 'FAILED';
   stopReason?: string;
 }
 
 /**
- * Formats a clean, lightweight plain-text execution summary instantaneously
- * from already-available run data (no external LLM network round-trip latency).
+ * Formats a clean, lightweight plain-text final execution report instantaneously
+ * from verified run data (no external LLM network round-trip latency).
  */
 export async function generateExecutionSummary(
   data: ExecutionSummaryInput,
@@ -164,12 +171,7 @@ export async function generateExecutionSummary(
   return formatFastExecutionSummary(data);
 }
 
-function shortHash(hash: string): string {
-  if (!hash || !hash.startsWith('0x') || hash.length <= 18) return hash || '-';
-  return `${hash.slice(0, 10)}…${hash.slice(-8)}`;
-}
-
-function formatNumber(raw: string, decimals = 6): string {
+function formatNumber(raw: string, decimals = 4): string {
   const n = Number(raw);
   if (!Number.isFinite(n)) return raw;
   return n.toLocaleString('en-US', {
@@ -179,29 +181,57 @@ function formatNumber(raw: string, decimals = 6): string {
 }
 
 export function formatFastExecutionSummary(data: ExecutionSummaryInput): string {
-  const pnlNum  = Number(data.pnlOrFee);
+  const pnlNum  = Number(data.netLossOrFeeUsdt);
   const pnlSign = Number.isFinite(pnlNum) && pnlNum > 0 ? '+' : '';
   const header  =
     data.status === 'COMPLETED'
-      ? '✅ Execution Completed!'
+      ? '✅ JAGER Full Cycle Completed!'
       : data.status === 'STOPPED'
-        ? '⚠️ Execution Stopped'
-        : '❌ Execution Failed';
+        ? '⚠️ JAGER Cycle Stopped'
+        : '❌ JAGER Cycle Failed';
 
   const lines = [
     header,
     ``,
     `🤖 Agent ID: ${data.agentId}`,
-    `💰 Mint Cost: ${data.mintCostBnb} BNB`,
-    `🪙 AI Tokens: ${formatNumber(data.tokensReceived, 4)} AI`,
-    `💵 Sale Proceeds: ${data.sellBnb} BNB`,
-    `📊 Net P&L: ${pnlSign}${data.pnlOrFee} BNB`,
+    `💳 Wallet: ${data.walletAddress}`,
     ``,
-    `🔗 Transactions (BSC):`,
-    `• Mint: ${shortHash(data.mintTxHash)}`,
-    `• Approve: ${shortHash(data.approveTxHash)}`,
-    `• Sell: ${shortHash(data.sellTxHash)}`,
+    `💰 Mint Cost (10 shares): ${data.mintCostUsdt} USDT`,
+    `🪙 JAGENT Minted & Sold: ${formatNumber(data.tokensReceived, 2)} JAGENT`,
+    `💵 USDT Received from Sell: ${data.sellUsdt} USDT`,
+    `📊 Net Loss / Fees: ${pnlSign}${data.netLossOrFeeUsdt} USDT`,
   ];
-  if (data.stopReason) lines.push(``, `⚠️ Note: ${data.stopReason}`);
+
+  if (data.inviteRewardUsdt && Number(data.inviteRewardUsdt) > 0) {
+    lines.push(`🎁 Invite Reward Claimed: +${data.inviteRewardUsdt} USDT`);
+  }
+
+  lines.push(
+    ``,
+    `🔗 Transaction Hashes (BSC):`,
+    `• approve (USDT): ${data.approveTxHash || 'N/A'}`,
+    `• mint (10 shares): ${data.mintTxHash || 'N/A'}`,
+  );
+
+  if (data.sellApproveTxHash) {
+    lines.push(`• sell_approve (JAGENT): ${data.sellApproveTxHash}`);
+  }
+
+  lines.push(
+    `• sell (JAGENT → USDT): ${data.sellTxHash || 'N/A'}`,
+    `• revoke (USDT → 0): ${data.revokeTxHash || 'N/A'}`,
+    `• claim (Referral Reward): ${data.claimTxHash || 'N/A'}`,
+  );
+
+  if (data.claimAttempts != null && data.claimAttempts > 0) {
+    const cap = data.claimMaxAttempts ?? 20;
+    const detail = data.claimStatusNote ? ` — ${data.claimStatusNote}` : '';
+    lines.push(`• Referral Claim Attempts: ${data.claimAttempts}/${cap}${detail}`);
+  }
+
+  if (data.stopReason) {
+    lines.push(``, `⚠️ Note: ${data.stopReason}`);
+  }
+
   return lines.join('\n');
 }

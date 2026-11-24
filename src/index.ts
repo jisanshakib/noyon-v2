@@ -10,7 +10,11 @@ import { logger } from './logger.js';
 import { handleStart }         from './handlers/start.js';
 import { handleConnectWallet } from './handlers/wallet.js';
 import { handleGenerateQr }    from './handlers/qr.js';
-import { handleCompleteProcess } from './handlers/execute.js';
+import {
+  handleCompleteProcess,
+  handleConfirmExecuteCycle,
+  handleCancelPreview,
+} from './handlers/execute.js';
 import { handleMyJobs }        from './handlers/jobs.js';
 import { handleCancel }        from './handlers/cancel.js';
 import {
@@ -62,11 +66,13 @@ bot.command('admin_start',      handleAdminBotStart);
 bot.command('start_bot',        handleAdminBotStart);
 
 // ── Inline button handlers ───────────────────────────────────────────────────
-bot.action('connect_wallet',   handleConnectWallet);
-bot.action('generate_qr',      handleGenerateQr);
-bot.action('complete_process', handleCompleteProcess);
-bot.action('my_jobs',          handleMyJobs);
-bot.action('cancel',           handleCancel);
+bot.action('connect_wallet',        handleConnectWallet);
+bot.action('generate_qr',           handleGenerateQr);
+bot.action('complete_process',      handleCompleteProcess);
+bot.action('confirm_execute_cycle', handleConfirmExecuteCycle);
+bot.action('cancel_preview',        handleCancelPreview);
+bot.action('my_jobs',               handleMyJobs);
+bot.action('cancel',                handleCancel);
 
 // Admin-only inline button callbacks (strictly gated inside handlers)
 bot.action('admin_overview',   handleAdminOverview);

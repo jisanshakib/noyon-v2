@@ -1,21 +1,22 @@
 // src/handlers/wallet.ts — /connect flow with live QR, background verification,
-// and immediate on-chain referral/completion eligibility checks.
+// and immediate JAGER contract eligibility & 1-time-per-ID/wallet checks.
+
 import { Context } from 'telegraf';
 import {
   bawAvailable,
   generatePairingUri,
   verifyAndBindSession,
+  syncAgentId,
 } from '../wallet.js';
 import {
-  checkWalletReferralEligibility,
-  OTHER_REFERRER_INELIGIBLE_MESSAGE,
+  ADDR,
+  checkWalletFreshness,
+  JAGER_ALREADY_COMPLETED_MESSAGE,
 } from '../bsc.js';
-import { ALREADY_COMPLETED_MESSAGE } from '../executor.js';
 import { generateQrBuffer } from '../qr.js';
 import {
   safeUpdateUser,
   hasCompletedCycleForAgent,
-  getLatestUnfinishedMint,
 } from '../db.js';
 import { KB } from '../keyboards.js';
 import { logger } from '../logger.js';
@@ -25,49 +26,94 @@ async function safeAnswerCb(ctx: Context, text?: string): Promise<void> {
 }
 
 /**
- * Checks whether a newly connected / already-connected wallet is blocked either
- * by another referrer on-chain (`OTHER_REFERRER_INELIGIBLE_MESSAGE`) or by prior
- * completion on the same Agent ID / Agent Wallet (`ALREADY_COMPLETED_MESSAGE`).
+ * Authoritative on-connect eligibility check scoped strictly to the current
+ * JAGER Mint Contract (`0x3643A907f875fA9B740e1C0747E91b5aA5222aB8`):
+ *   1. Checks PostgreSQL for a COMPLETED JAGER execution on this `.ai` ID / wallet
+ *      (ignores legacy SPACE ID / BNB rows) → blocks with clear 1-time-per-ID limit message.
+ *   2. Checks on-chain `JagentMintV2` (`registrar`, `mintedCount`, `quotaOf`, `paidOnce`, `paused`)
+ *      + live `jager.live/api/agent/status` → immediately blocks ineligible wallets
+ *      (`NO_AGENT_ID`, `ALREADY_MINTED`, `INSUFFICIENT_QUOTA`, `MINT_PAUSED`, `CHECK_UNAVAILABLE`)
+ *      with a clear bilingual "Wallet Not Eligible" notification so users cannot enter a broken cycle.
  */
 async function checkConnectedWalletStatus(
   userId: number,
   walletAddress: string,
   agentIdName?: string,
-): Promise<{ blocked: true; message: string; keyboard: typeof KB.start } | { blocked: false }> {
-  const [unfinishedMint, localCompleted] = await Promise.all([
-    getLatestUnfinishedMint(userId, walletAddress),
-    hasCompletedCycleForAgent({ agentIdName: agentIdName ?? null, walletAddress }),
+): Promise<
+  | { blocked: true; message: string; keyboard: typeof KB.start }
+  | { blocked: false; resolvedAgentId?: string; freshnessNote: string }
+> {
+  const [localCompleted, freshness] = await Promise.all([
+    hasCompletedCycleForAgent({
+      mintContract: ADDR.MINT_CONTRACT,
+      agentIdName: agentIdName ?? null,
+      walletAddress,
+    }),
+    checkWalletFreshness(walletAddress),
   ]);
 
-  const onChainElig = await checkWalletReferralEligibility(walletAddress, {
-    hasLocalUnfinishedMint: Boolean(unfinishedMint),
-  });
+  const resolvedAgentId = freshness.agentId || agentIdName || undefined;
+  if (resolvedAgentId && resolvedAgentId !== agentIdName) {
+    await syncAgentId(userId, resolvedAgentId);
+  }
 
-  if (!onChainElig.eligible && onChainElig.reasonCode === 'OTHER_REFERRER') {
+  // Re-check DB lock using the on-chain resolved .ai Agent ID if not known before
+  if (!localCompleted.completed && resolvedAgentId && resolvedAgentId !== agentIdName) {
+    const resolvedCompleted = await hasCompletedCycleForAgent({
+      mintContract: ADDR.MINT_CONTRACT,
+      agentIdName: resolvedAgentId,
+      walletAddress,
+    });
+    if (resolvedCompleted.completed) {
+      logger.info(
+        { userId, walletAddress, resolvedAgentId, matchedBy: resolvedCompleted.matchedBy },
+        'Wallet connect blocked: resolved .ai Agent ID already completed JAGER cycle',
+      );
+      return {
+        blocked: true,
+        message: JAGER_ALREADY_COMPLETED_MESSAGE,
+        keyboard: KB.start,
+      };
+    }
+  }
+
+  if (localCompleted.completed) {
     logger.info(
-      { userId, walletAddress, agentIdName, details: onChainElig.details },
-      'Wallet connect blocked: already completed under another referral code',
+      { userId, walletAddress, agentIdName: resolvedAgentId, matchedBy: localCompleted.matchedBy },
+      'Wallet connect blocked: Agent ID / Wallet already completed JAGER full cycle (1-time limit)',
     );
     return {
       blocked: true,
-      message: OTHER_REFERRER_INELIGIBLE_MESSAGE,
+      message: JAGER_ALREADY_COMPLETED_MESSAGE,
       keyboard: KB.start,
     };
   }
 
-  if (localCompleted.completed || onChainElig.reasonCode === 'ALREADY_COMPLETED_OWN_REFERRER') {
+  if (!freshness.fresh) {
     logger.info(
-      { userId, walletAddress, agentIdName, matchedBy: localCompleted.matchedBy ?? 'onchain' },
-      'Wallet connect notice: Agent ID / Wallet already completed a full cycle',
+      {
+        userId,
+        walletAddress,
+        mintContract: ADDR.MINT_CONTRACT,
+        agentIdName: resolvedAgentId ?? null,
+        reasonCode: freshness.reasonCode,
+        minted: freshness.minted.toString(),
+        remaining: freshness.remaining.toString(),
+      },
+      'Wallet connect blocked: wallet is not eligible on JAGER contract',
     );
     return {
       blocked: true,
-      message: ALREADY_COMPLETED_MESSAGE,
+      message: freshness.userMessage ?? `⛔ আপনার ওয়ালেট নট ইলিজিবল (Wallet Not Eligible)\n\n${freshness.reason ?? 'Wallet does not meet JAGER eligibility requirements.'}`,
       keyboard: KB.start,
     };
   }
 
-  return { blocked: false };
+  return {
+    blocked: false,
+    resolvedAgentId,
+    freshnessNote: `Eligible ✅ (minted: ${freshness.minted.toString()}, remaining: ${freshness.remaining.toString()} | Limit: 1 cycle per ID/wallet)`,
+  };
 }
 
 export async function handleConnectWallet(ctx: Context): Promise<void> {
@@ -97,7 +143,7 @@ export async function handleConnectWallet(ctx: Context): Promise<void> {
       return;
     }
 
-    // Handle already-connected case — still run live on-chain referral/completion check
+    // Handle already-connected case — run immediate JAGER eligibility & 1-time limit check
     if (session.walletAddress) {
       const status = await checkConnectedWalletStatus(userId, session.walletAddress, session.agentIdName);
       if (status.blocked) {
@@ -105,10 +151,13 @@ export async function handleConnectWallet(ctx: Context): Promise<void> {
         return;
       }
 
+      const displayAgent = status.resolvedAgentId ?? session.agentIdName;
       await ctx.reply(
-        `✅ Already connected!\n\nAddress: ${session.walletAddress}\n` +
-        (session.agentIdName ? `Agent ID: ${session.agentIdName}\n` : '') +
-        '\nTap Complete All Process to run the cycle.',
+        `✅ Already connected!\n\n` +
+        `Address: ${session.walletAddress}\n` +
+        (displayAgent ? `Agent ID: ${displayAgent}\n` : '') +
+        `${status.freshnessNote}\n\n` +
+        `Tap Complete All Process to run silent preflight checks and review the single combined JAGER preview.`,
         KB.afterConnect,
       );
       return;
@@ -135,33 +184,37 @@ export async function handleConnectWallet(ctx: Context): Promise<void> {
         },
       );
     } catch {
-      // QR generation failed — send text link
       await ctx.reply(qrCaption, KB.cancelOnly);
     }
 
-    // Background verification — checks on-chain referral eligibility immediately upon binding
+    // Background verification — immediately checks JAGER eligibility upon binding
     verifyAndBindSession(
       userId,
       session.qrCodeId,
       async (connected) => {
         try {
-          if (connected.walletAddress) {
-            const status = await checkConnectedWalletStatus(
-              userId,
-              connected.walletAddress,
-              connected.agentIdName,
-            );
-            if (status.blocked) {
-              await ctx.reply(status.message, status.keyboard);
-              return;
-            }
+          if (!connected.walletAddress) {
+            await ctx.reply('❌ Connected but wallet address could not be read. Tap Connect Wallet to try again.', KB.start);
+            return;
           }
 
+          const status = await checkConnectedWalletStatus(
+            userId,
+            connected.walletAddress,
+            connected.agentIdName,
+          );
+          if (status.blocked) {
+            await ctx.reply(status.message, status.keyboard);
+            return;
+          }
+
+          const displayAgent = status.resolvedAgentId ?? connected.agentIdName;
           await ctx.reply(
             `✅ Wallet connected!\n\n` +
             `Address: ${connected.walletAddress}\n` +
-            (connected.agentIdName ? `Agent ID: ${connected.agentIdName}\n` : '(No .ai Agent ID claimed yet)\n') +
-            `\nTap Complete All Process to start the mint/sell cycle.`,
+            (displayAgent ? `Agent ID: ${displayAgent}\n` : '') +
+            `${status.freshnessNote}\n\n` +
+            `Tap Complete All Process to run silent preflight checks and view the one-confirm JAGER preview.`,
             KB.afterConnect,
           );
         } catch (e) { logger.warn({ e, userId }, 'Could not send connected message'); }
