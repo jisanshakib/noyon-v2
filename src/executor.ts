@@ -34,6 +34,7 @@
 //        cost, underfunded USDT/BNB, already minted / remaining < 10, Dev Mode OFF).
 // ═══════════════════════════════════════════════════════════════════════
 
+import crypto from 'crypto';
 import { ethers } from 'ethers';
 import {
   ADDR,
@@ -76,6 +77,8 @@ import {
 import { generateExecutionSummary } from './gemini.js';
 import {
   insertExecution,
+  queueDeferredExecutionWrite,
+  withDbRetry,
   hasCompletedCycleForAgent,
   recordCompletedAgentInMemory,
   isBotPaused,
@@ -489,6 +492,9 @@ export type CycleTxKey = 'approve' | 'mint' | 'sell_approve' | 'sell' | 'revoke'
 
 export interface ExecutionSuccess {
   ok: true;
+  /** Globally unique per-execution identifier used for notification deduplication (never per telegram_user_id). */
+  runId: string;
+  executionId: number | null;
   summary: string;
   agentId: string;
   walletAddress: string;
@@ -1886,7 +1892,7 @@ export async function runFullExecution(
 
     const dbSummaryNote = !claimConfirmed ? claimStatusNote : undefined;
 
-    const [completedCount, summary] = await Promise.all([
+    const [logRes, summary] = await Promise.all([
       logExecution(
         userId,
         walletAddress,
@@ -1898,6 +1904,7 @@ export async function runFullExecution(
         txHashes,
         resolvedAgentId,
         dbSummaryNote,
+        claimAttempts,
       ),
       generateExecutionSummary({
         agentId: resolvedAgentId,
@@ -1922,6 +1929,8 @@ export async function runFullExecution(
 
     return {
       ok: true,
+      runId: crypto.randomUUID(),
+      executionId: logRes.executionId,
       summary,
       agentId: resolvedAgentId,
       walletAddress,
@@ -1938,7 +1947,7 @@ export async function runFullExecution(
       claimTxHash,
       claimAttempts,
       claimStatusNote,
-      completedCount,
+      completedCount: logRes.completedCount,
     };
   } catch (err: unknown) {
     const e = err as Error & { isSessionExpired?: boolean; step?: string };
@@ -1971,69 +1980,79 @@ async function logExecution(
   txHashes: Partial<Record<string, string>>,
   agentId: string,
   summaryNote?: string,
-): Promise<number> {
-  try {
-    const mintCostUsdt = Number(ethers.formatUnits(mintCostUsdtWei, TOKEN_DECIMALS));
-    const tokensF      = Number(ethers.formatUnits(tokensWei, TOKEN_DECIMALS));
-    const sellUsdtF    = Number(ethers.formatUnits(sellUsdtWei, TOKEN_DECIMALS));
-    const pnlUsdt      = sellUsdtF - mintCostUsdt;
-    const rewardUsdt   = Number(ethers.formatUnits(inviteRewardUsdtWei, TOKEN_DECIMALS));
+  claimAttempts?: number,
+): Promise<{ completedCount: number; executionId: number | null }> {
+  const mintCostUsdt = Number(ethers.formatUnits(mintCostUsdtWei, TOKEN_DECIMALS));
+  const tokensF      = Number(ethers.formatUnits(tokensWei, TOKEN_DECIMALS));
+  const sellUsdtF    = Number(ethers.formatUnits(sellUsdtWei, TOKEN_DECIMALS));
+  const pnlUsdt      = sellUsdtF - mintCostUsdt;
+  const rewardUsdt   = Number(ethers.formatUnits(inviteRewardUsdtWei, TOKEN_DECIMALS));
 
-    const agentIdName: string | null =
-      agentId?.trim() ? agentId.trim()
-      : walletAddress?.trim() ? walletAddress.trim()
-      : null;
+  const agentIdName: string | null =
+    agentId?.trim() ? agentId.trim()
+    : walletAddress?.trim() ? walletAddress.trim()
+    : null;
 
-    const mintStr   = mintCostUsdt !== 0 ? mintCostUsdt.toFixed(6) : null;
-    const sellStr   = sellUsdtF    !== 0 ? sellUsdtF.toFixed(6)    : null;
-    const pnlStr    = pnlUsdt.toFixed(6);
-    const rewardStr = rewardUsdt   > 0   ? rewardUsdt.toFixed(6)   : null;
+  const mintStr   = mintCostUsdt !== 0 ? mintCostUsdt.toFixed(6) : null;
+  const sellStr   = sellUsdtF    !== 0 ? sellUsdtF.toFixed(6)    : null;
+  const pnlStr    = pnlUsdt.toFixed(6);
+  const rewardStr = rewardUsdt   > 0   ? rewardUsdt.toFixed(6)   : null;
 
-    const insertPromise = insertExecution({
-      telegram_user_id:   userId,
-      wallet_address:     walletAddress?.trim() || null,
-      agent_id_name:      agentIdName,
-      mint_contract:      ADDR.MINT_CONTRACT,
-      status,
-      currency:           'USDT',
-      mint_cost_bnb:      mintStr,
-      mint_cost_usdt:     mintStr,
-      tokens_received:    tokensF !== 0 ? tokensF.toFixed(6) : null,
-      sell_bnb:           sellStr,
-      sell_usdt:          sellStr,
-      pnl_or_fee:         pnlStr,
-      pnl_or_fee_usdt:    pnlStr,
-      invite_reward_usdt: rewardStr,
-      tx_hashes: Object.keys(txHashes).length > 0
-        ? (txHashes as Record<string, string>) : null,
-      summary: summaryNote ?? null,
+  const execPayload = {
+    telegram_user_id:   userId,
+    wallet_address:     walletAddress?.trim() || null,
+    agent_id_name:      agentIdName,
+    mint_contract:      ADDR.MINT_CONTRACT,
+    status,
+    currency:           'USDT',
+    mint_cost_bnb:      mintStr,
+    mint_cost_usdt:     mintStr,
+    tokens_received:    tokensF !== 0 ? tokensF.toFixed(6) : null,
+    sell_bnb:           sellStr,
+    sell_usdt:          sellStr,
+    pnl_or_fee:         pnlStr,
+    pnl_or_fee_usdt:    pnlStr,
+    invite_reward_usdt: rewardStr,
+    claim_attempts:     claimAttempts ?? null,
+    tx_hashes: Object.keys(txHashes).length > 0
+      ? (txHashes as Record<string, string>) : null,
+    summary: summaryNote ?? null,
+  };
+
+  if (status === 'COMPLETED') {
+    recordCompletedAgentInMemory({
+      mintContract: ADDR.MINT_CONTRACT,
+      agentIdName,
+      walletAddress,
     });
+  }
+
+  try {
+    const insertPromise = insertExecution(execPayload);
 
     if (status === 'COMPLETED') {
-      recordCompletedAgentInMemory({
-        mintContract: ADDR.MINT_CONTRACT,
-        agentIdName,
-        walletAddress,
-      });
-      const [, userRes] = await Promise.all([
+      const [executionId, userRes] = await Promise.all([
         insertPromise,
-        pool.query<{ completed_count: number }>(
-          `UPDATE users
-           SET completed_count = completed_count + 1,
-               current_step    = 'completed',
-               last_active_at  = now()
-           WHERE telegram_user_id = $1
-           RETURNING completed_count`,
-          [userId],
+        withDbRetry('incrementCompletedCount', () =>
+          pool.query<{ completed_count: number }>(
+            `UPDATE users
+             SET completed_count = completed_count + 1,
+                 current_step    = 'completed',
+                 last_active_at  = now()
+             WHERE telegram_user_id = $1
+             RETURNING completed_count`,
+            [userId],
+          ),
         ),
       ]);
-      return userRes.rows[0]?.completed_count ?? 1;
+      return { completedCount: userRes.rows[0]?.completed_count ?? 1, executionId };
     }
 
-    await insertPromise;
-    return 0;
+    const executionId = await insertPromise;
+    return { completedCount: 0, executionId };
   } catch (dbErr) {
-    logger.error({ dbErr }, 'logExecution: DB write failed');
-    return status === 'COMPLETED' ? 1 : 0;
+    logger.error({ dbErr, userId, status }, 'logExecution: DB write failed after retries — buffering for background flush');
+    queueDeferredExecutionWrite(execPayload, status === 'COMPLETED');
+    return { completedCount: status === 'COMPLETED' ? 1 : 0, executionId: null };
   }
 }

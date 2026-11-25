@@ -7,6 +7,7 @@ import {
   generatePairingUri,
   verifyAndBindSession,
   syncAgentId,
+  clearSession,
 } from '../wallet.js';
 import {
   ADDR,
@@ -17,9 +18,17 @@ import { generateQrBuffer } from '../qr.js';
 import {
   safeUpdateUser,
   hasCompletedCycleForAgent,
+  resetUserWalletBinding,
 } from '../db.js';
+import { isUserLocked } from '../executor.js';
+import { isAwaitingPayoutWallet } from './execute.js';
+import { isAdminId } from '../config.js';
 import { KB } from '../keyboards.js';
 import { logger } from '../logger.js';
+
+const ADMIN_USER_MODE_BLOCKED_MSG =
+  '🛡️ Admin Role Isolation: Admin accounts cannot use regular user wallet pairing or task execution.\n\n' +
+  'Use /admin → "💼 Connect Admin Wallet" (/admin_wallet) to manage the Admin Auto-Payment Treasury Wallet.';
 
 async function safeAnswerCb(ctx: Context, text?: string): Promise<void> {
   try { if (ctx.callbackQuery) await ctx.answerCbQuery(text); } catch { /* ok */ }
@@ -119,6 +128,28 @@ async function checkConnectedWalletStatus(
 export async function handleConnectWallet(ctx: Context): Promise<void> {
   const userId = ctx.from?.id;
   if (!userId) return;
+
+  if (isAdminId(userId)) {
+    await safeAnswerCb(ctx, 'Admin accounts use Admin Dashboard');
+    await ctx.reply(ADMIN_USER_MODE_BLOCKED_MSG, KB.adminMenu);
+    return;
+  }
+
+  if (isUserLocked(userId)) {
+    await safeAnswerCb(ctx, 'Job currently running');
+    await ctx.reply('⏳ A job is already running. Please wait for it to finish or tap Cancel first.', KB.cancelOnly);
+    return;
+  }
+
+  if (isAwaitingPayoutWallet(userId)) {
+    await safeAnswerCb(ctx, 'পেমেন্ট ওয়ালেট দিন বা স্কিপ করুন');
+    await ctx.reply(
+      '💳 নতুন ওয়ালেট কানেক্ট করার আগে অনুগ্রহ করে আপনার সম্পন্ন হওয়া সাইকেলের BEP-20 পেমেন্ট ওয়ালেট অ্যাড্রেসটি পাঠান অথবা "স্কিপ" বাটনে ক্লিক করুন।',
+      KB.payoutWalletPrompt,
+    );
+    return;
+  }
+
   await safeAnswerCb(ctx, 'Starting pairing…');
 
   if (!bawAvailable()) {
@@ -147,7 +178,15 @@ export async function handleConnectWallet(ctx: Context): Promise<void> {
     if (session.walletAddress) {
       const status = await checkConnectedWalletStatus(userId, session.walletAddress, session.agentIdName);
       if (status.blocked) {
-        await ctx.reply(status.message, status.keyboard);
+        // Automatically sign out the completed/ineligible wallet so the user can immediately
+        // pair a different eligible .ai Agent ID / wallet on their next tap.
+        try { await clearSession(userId); } catch { /* ignore */ }
+        try { await resetUserWalletBinding(userId); } catch { /* ignore */ }
+        await ctx.reply(
+          `${status.message}\n\n` +
+          `🔄 This wallet has been signed out automatically. Tap "🔗 Connect Your Binance Wallet" to connect a different eligible .ai wallet.`,
+          status.keyboard,
+        );
         return;
       }
 
@@ -204,7 +243,14 @@ export async function handleConnectWallet(ctx: Context): Promise<void> {
             connected.agentIdName,
           );
           if (status.blocked) {
-            await ctx.reply(status.message, status.keyboard);
+            // Automatically clear blocked/already-completed wallet so user can pair a fresh .ai wallet right away
+            try { await clearSession(userId); } catch { /* ignore */ }
+            try { await resetUserWalletBinding(userId); } catch { /* ignore */ }
+            await ctx.reply(
+              `${status.message}\n\n` +
+              `🔄 This wallet has been signed out automatically. Tap "🔗 Connect Your Binance Wallet" to connect a different eligible .ai wallet.`,
+              status.keyboard,
+            );
             return;
           }
 
@@ -229,4 +275,50 @@ export async function handleConnectWallet(ctx: Context): Promise<void> {
     logger.error({ err, userId }, 'handleConnectWallet error');
     await ctx.reply('❌ Failed to start pairing. Please try again.', KB.start);
   }
+}
+
+/**
+ * Cleanly disconnects the current wallet binding (without touching historical completions)
+ * and immediately opens a fresh pairing QR so the same Telegram user can run another
+ * distinct `.ai` Agent ID / Binance wallet.
+ */
+export async function handleSwitchWallet(ctx: Context): Promise<void> {
+  const userId = ctx.from?.id;
+  if (!userId) return;
+
+  if (isAdminId(userId)) {
+    await safeAnswerCb(ctx, 'Admin accounts use Admin Dashboard');
+    await ctx.reply(ADMIN_USER_MODE_BLOCKED_MSG, KB.adminMenu);
+    return;
+  }
+
+  if (isUserLocked(userId)) {
+    await safeAnswerCb(ctx, 'Job currently running');
+    await ctx.reply('⏳ A job is currently running. Please wait for it to finish or tap Cancel first.', KB.cancelOnly);
+    return;
+  }
+
+  if (isAwaitingPayoutWallet(userId)) {
+    await safeAnswerCb(ctx, 'পেমেন্ট ওয়ালেট দিন বা স্কিপ করুন');
+    await ctx.reply(
+      '💳 নতুন ওয়ালেট কানেক্ট করার আগে অনুগ্রহ করে আপনার সম্পন্ন হওয়া সাইকেলের BEP-20 পেমেন্ট ওয়ালেট অ্যাড্রেসটি পাঠান অথবা "স্কিপ" বাটনে ক্লিক করুন।',
+      KB.payoutWalletPrompt,
+    );
+    return;
+  }
+
+  await safeAnswerCb(ctx, 'Switching to a new wallet…');
+
+  try {
+    await clearSession(userId);
+  } catch (err) {
+    logger.warn({ err, userId }, 'handleSwitchWallet: clearSession error (continuing)');
+  }
+  try {
+    await resetUserWalletBinding(userId);
+  } catch (err) {
+    logger.warn({ err, userId }, 'handleSwitchWallet: resetUserWalletBinding error (continuing)');
+  }
+
+  await handleConnectWallet(ctx);
 }

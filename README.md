@@ -40,8 +40,10 @@ Every mint transaction automatically uses the hardcoded referrer (never `0x0`, n
    - Wallet is underfunded (USDT or BNB) or already minted (`minted > 0` / `remaining < 10`)
    - Developer Mode is OFF / expired / balance cap exceeded
    - User clicks Cancel or `baw` session expires
-6. **Final Report & Database Logging:**
-   - Sends ONE final report showing Mint Cost (USDT), JAGENT Minted & Sold, USDT Received from Sell, Net Loss/Fees (USDT), Invite Reward (if claimed), and every transaction hash (`approve`, `mint`, `sell_approve`, `sell`, `revoke`, `claim`).
+6. **Pre-Summary BEP-20 Payment Wallet Prompt, Final Report & Admin Notification:**
+   - Right after Steps A–E finish (and before sending the final summary), prompts the user in Bangla to paste a valid **BEP-20 (`0x...`)** payout wallet address or tap **⏭️ স্কিপ (এজেন্ট ওয়ালেটে পেমেন্ট)** (defaults to their connected Agent Wallet).
+   - Strictly validates pasted addresses against `/^0x[a-fA-F0-9]{40}$/` (rejecting invalid formats in Bangla) and saves `payout_wallet_address` + `payout_mode` (`CUSTOM_BEP20` or `AGENT_WALLET_SKIPPED`) in PostgreSQL `executions`.
+   - Delivers ONE complete final summary to the user including their selected payout wallet, and sends an HTML admin payout alert with the payout address wrapped in `<code>0x...</code>` for one-click copy.
 
 ---
 

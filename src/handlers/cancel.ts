@@ -5,6 +5,8 @@ import { Context } from 'telegraf';
 import { cancelUser } from '../db.js';
 import { clearSession } from '../wallet.js';
 import { isUserLocked, requestCancelExecution, clearPendingPreview } from '../executor.js';
+import { clearPendingPayout } from './execute.js';
+import { isAdminId } from '../config.js';
 import { KB } from '../keyboards.js';
 import { logger } from '../logger.js';
 
@@ -22,9 +24,16 @@ export async function handleCancel(ctx: Context): Promise<void> {
   const userId = ctx.from?.id;
   if (!userId) return;
 
+  if (isAdminId(userId)) {
+    await safeAnswerCb(ctx, 'Admin Dashboard active');
+    await ctx.reply('🛡️ Admin accounts use Admin Dashboard controls (/admin).', KB.adminMenu);
+    return;
+  }
+
   await safeAnswerCb(ctx, 'Cancelling…');
 
   clearPendingPreview(userId);
+  clearPendingPayout(userId);
   const wasRunning = isUserLocked(userId);
   if (wasRunning) {
     requestCancelExecution(userId);
