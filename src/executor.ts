@@ -39,7 +39,6 @@ import { ethers } from 'ethers';
 import {
   ADDR,
   REFERRER_NAME,
-  PLATFORM_REF_URL,
   MINT_SHARES,
   TOKEN_DECIMALS,
   MIN_BNB_GAS,
@@ -304,31 +303,29 @@ export function formatCyclePreviewText(p: CyclePreview): string {
   const expectedTokensF = Number(ethers.formatUnits(p.expectedJagentWei, TOKEN_DECIMALS));
 
   return [
-    `📋 JAGER MINT — ONE-CONFIRM FULL CYCLE PREVIEW`,
+    `📋 ONE-CONFIRM 5-STEP EXECUTION PREVIEW`,
     ``,
     `🤖 Agent ID: ${p.agentId}`,
     `💳 Wallet: ${p.walletAddress}`,
     `📊 Quota: minted ${p.mintedCount.toString()} / remaining ${p.remainingQuota.toString()} (Fresh ✅)`,
     `💰 Balances: ${usdtBalF.toFixed(4)} USDT | ${bnbBalF.toFixed(5)} BNB`,
-    `📌 Fixed Referrer: ${REFERRER_NAME} (${ADDR.REFERRER})`,
-    `🌐 Platform: ${PLATFORM_REF_URL}`,
     ``,
-    `── Live Cycle Numbers ──`,
-    `• Live Price: ${p.priceUsdtPerShare} USDT / share (from jager.live/api/stats)`,
-    `• Exact USDT Approve Amount: ${approveF.toFixed(4)} USDT (10 shares × 1.02, NO unlimited approval)`,
+    `── Live Numbers ──`,
+    `• Live Price: ${p.priceUsdtPerShare} USDT / share`,
+    `• Exact USDT Approve (live × 10 × 1.02): ${approveF.toFixed(4)} USDT (NO unlimited approval)`,
     `• Mint Cost (10 shares in 1 TX): ${mintCostF.toFixed(4)} USDT`,
-    `• Expected Output: ~${expectedTokensF.toLocaleString('en-US', { maximumFractionDigits: 0 })} JAGENT`,
-    `• Est. PancakeSwap V2 Sell Value: ~${sellEstF.toFixed(4)} USDT (JAGENT → USDT, net of 2% sell tax)`,
+    `• Expected Tokens: ~${expectedTokensF.toLocaleString('en-US', { maximumFractionDigits: 0 })} tokens`,
+    `• Est. Sell Proceeds (ALL tokens → USDT): ~${sellEstF.toFixed(4)} USDT`,
     `• Est. Net Loss / Fees: ${pnlSign}${pnlEstF.toFixed(4)} USDT (${p.estimatedLossPct.toFixed(2)}% vs mint cost)`,
     ``,
-    `── Automated Back-to-Back Steps (after 1 confirmation) ──`,
-    `A. Exact USDT Approve (${approveF.toFixed(4)} USDT → Mint Contract)`,
-    `B. Mint 10 Shares in ONE TX (referrer: ${REFERRER_NAME})`,
-    `C. Immediate Sell 100% JAGENT → USDT (stops if quote < 92% of mint cost)`,
-    `D. Revoke Leftover USDT Approval back to 0`,
-    `E. Claim Referral Reward (up to ${CLAIM_MAX_ATTEMPTS} attempts if due)`,
+    `── 5 Back-to-Back Steps (1 Confirmation Only) ──`,
+    `1. APPROVE — Exact ${approveF.toFixed(4)} USDT approval (NO unlimited approval)`,
+    `2. MINT — 10 shares in ONE single TX (simulated first, never split)`,
+    `3. SELL — Sell ALL minted tokens immediately (stops if quote < 92% of mint cost)`,
+    `4. REVOKE — Revoke leftover USDT approval back to 0`,
+    `5. CLAIM — Claim the 1 USDT bonus & confirm receipt (up to ${CLAIM_MAX_ATTEMPTS} attempts)`,
     ``,
-    `⚠️ LOW/MEDIUM gas settings only. Confirm ONCE below to execute all steps automatically:`,
+    `⚠️ LOW or MEDIUM gas only. Never asks for seed phrase or private key. Confirm ONCE below:`,
   ].join('\n');
 }
 
@@ -384,7 +381,7 @@ export async function prepareCyclePreview(userId: number): Promise<PreviewResult
     ]);
 
     if (!liveStats.mintingOpen || liveStats.paused) {
-      const reason = 'JAGER minting is currently closed or paused on jager.live.';
+      const reason = 'Minting is currently closed or paused. Please try again later.';
       await logExecution(userId, walletAddress, 'STOPPED', 0n, 0n, 0n, 0n, {}, agentId, reason);
       return { ok: false, reason: ensureStopPrefix(reason) };
     }
@@ -498,11 +495,15 @@ export interface ExecutionSuccess {
   summary: string;
   agentId: string;
   walletAddress: string;
+  /** Live price per share (USDT) fetched from https://jager.live/api/stats and used for this run. */
+  livePriceUsdt?: string;
   mintCostUsdt: string;
   tokensReceived: string;
   sellUsdt: string;
   netLossOrFeeUsdt: string;
   inviteRewardUsdt?: string;
+  /** Total BNB gas spent across all on-chain transactions in Steps 1–4. */
+  totalGasBnb?: string;
   approveTxHash: string;
   mintTxHash: string;
   sellApproveTxHash?: string;
@@ -567,6 +568,20 @@ export async function runFullExecution(
   let trackedTokensWei = 0n;
   let trackedSellUsdtWei = 0n;
   let trackedInviteRewardWei = 0n;
+  let trackedGasWei = 0n;
+  let livePriceUsedUsdt = String(preview.priceUsdtPerShare);
+  const bnbBeforeCycle = await readBnbBalance(preview.walletAddress).catch(() => null);
+
+  const addReceiptGas = (receipt?: ethers.TransactionReceipt | null): void => {
+    if (!receipt) return;
+    try {
+      const gasUsed = BigInt(receipt.gasUsed ?? 0n);
+      const gasPrice = BigInt(receipt.gasPrice ?? 0n);
+      if (gasUsed > 0n && gasPrice > 0n) {
+        trackedGasWei += gasUsed * gasPrice;
+      }
+    } catch { /* ignore */ }
+  };
 
   const stopNow = async (
     status: 'STOPPED' | 'CANCELLED' | 'FAILED',
@@ -628,7 +643,7 @@ export async function runFullExecution(
     const bawSettingsRes = await getBawWalletSettings(userId);
 
     if (!liveStats.mintingOpen || liveStats.paused) {
-      return await stopNow('STOPPED', 'JAGER minting is currently closed or paused on jager.live.');
+      return await stopNow('STOPPED', 'Minting is currently closed or paused. Please try again later.');
     }
 
     const session = getSession(userId);
@@ -681,7 +696,7 @@ export async function runFullExecution(
         if (approveAttempt > 0) {
           liveStats = await fetchJagerLiveStats();
           if (!liveStats.mintingOpen || liveStats.paused) {
-            return await stopNow('STOPPED', 'JAGER minting is currently closed or paused on jager.live.');
+            return await stopNow('STOPPED', 'Minting is currently closed or paused. Please try again later.');
           }
           exactApproveWei = liveStats.maxCostUsdtWei;
         }
@@ -723,8 +738,8 @@ export async function runFullExecution(
         if (approveAttempt <= 2 || now - lastApproveEditAt >= STATUS_THROTTLE_MS) {
           lastApproveEditAt = now;
           await onStatus(
-            `⚙️ Step A/E — Exact USDT Approve${approveAttempt > 1 ? ` (attempt #${approveAttempt})` : ''}\n` +
-            `Approving exactly ${exactApproveStr} USDT (10 shares × 1.02) for JAGER Mint Contract…`,
+            `⚙️ Step 1/5 (APPROVE) — Exact USDT Approve${approveAttempt > 1 ? ` (attempt #${approveAttempt})` : ''}\n` +
+            `Approving exactly ${exactApproveStr} USDT (live × 10 × 1.02, NO unlimited approval)…`,
           );
         }
 
@@ -780,7 +795,8 @@ export async function runFullExecution(
           throw new Error(`Step A USDT approve TX ${approveTxHash.slice(0, 12)}… confirmation timed out — verifying on-chain`);
         }
 
-        logger.info({ userId, step: 'approve_usdt', attempts: approveAttempt, approveTxHash }, 'Step A USDT approve confirmed');
+        addReceiptGas(approveReceipt.receipt);
+        logger.info({ userId, step: 'approve_usdt', attempts: approveAttempt, approveTxHash }, 'Step 1/5 USDT approve confirmed');
         // Wait briefly for load-balanced BSC RPC nodes to reflect the confirmed allowance
         await waitForAllowancePropagation(
           () => readUsdtAllowance(walletAddress, ADDR.MINT_CONTRACT),
@@ -878,7 +894,7 @@ export async function runFullExecution(
         // Refresh live stats & check sell quote + balances before each mint attempt
         liveStats = await fetchJagerLiveStats();
         if (!liveStats.mintingOpen || liveStats.paused) {
-          return await stopNow('STOPPED', 'JAGER minting is currently closed or paused on jager.live.');
+          return await stopNow('STOPPED', 'Minting is currently closed or paused. Please try again later.');
         }
 
         const neededMaxCost = liveStats.maxCostUsdtWei;
@@ -949,6 +965,7 @@ export async function runFullExecution(
           if (topUpRcpt.state !== 'confirmed') {
             throw new Error(`USDT allowance refresh TX ${approveTxHash.slice(0, 12)}… did not confirm (${topUpRcpt.state})`);
           }
+          addReceiptGas(topUpRcpt.receipt);
           exactApproveWei = neededMaxCost;
           await waitForAllowancePropagation(
             () => readUsdtAllowance(walletAddress, ADDR.MINT_CONTRACT),
@@ -957,15 +974,16 @@ export async function runFullExecution(
           );
         }
 
+        livePriceUsedUsdt = String(liveStats.priceUsdtPerShare);
         const liveMintCostStr = Number(ethers.formatUnits(liveStats.mintCostUsdtWei, TOKEN_DECIMALS)).toFixed(4);
         const maxCostStr      = Number(ethers.formatUnits(neededMaxCost, TOKEN_DECIMALS)).toFixed(4);
         const now = Date.now();
         if (mintAttempt <= 2 || now - lastMintEditAt >= STATUS_THROTTLE_MS) {
           lastMintEditAt = now;
           await onStatus(
-            `⚙️ Step B/E — Minting 10 Shares in ONE Transaction${mintAttempt > 1 ? ` (attempt #${mintAttempt})` : ''}\n` +
-            `Live cost: ${liveMintCostStr} USDT | MaxCost: ${maxCostStr} USDT | Referrer: ${REFERRER_NAME}\n` +
-            `Simulating mint(10, referrer, maxCost)…`,
+            `⚙️ Step 2/5 (MINT) — Minting 10 Shares in ONE Transaction${mintAttempt > 1 ? ` (attempt #${mintAttempt})` : ''}\n` +
+            `Live price: ${livePriceUsedUsdt} USDT/share | Cost: ${liveMintCostStr} USDT | MaxCost: ${maxCostStr} USDT\n` +
+            `Simulating mint transaction…`,
           );
         }
 
@@ -1026,6 +1044,7 @@ export async function runFullExecution(
           throw new Error(`Step B mint TX ${mintTxHash.slice(0, 12)}… confirmation timed out — verifying on-chain`);
         }
 
+        addReceiptGas(mintReceipt.receipt);
         actualMintCostUsdtWei =
           mintReceipt.mintPaidUsdtFromLogs > 0n
             ? mintReceipt.mintPaidUsdtFromLogs
@@ -1033,7 +1052,7 @@ export async function runFullExecution(
         trackedMintCostUsdtWei = actualMintCostUsdtWei;
 
         // Confirm JAGENT balance received (handle brief RPC read lag)
-        await onStatus(`✅ Step B/E — Mint confirmed in block #${mintReceipt.receipt.blockNumber}. Verifying JAGENT balance…`);
+        await onStatus(`✅ Step 2/5 (MINT) confirmed in block #${mintReceipt.receipt.blockNumber}. Verifying JAGENT balance…`);
         jagentReceivedWei = 0n;
         for (let poll = 0; poll < 10; poll++) {
           if (isCancelled(userId)) {
@@ -1184,7 +1203,7 @@ export async function runFullExecution(
           if (sellAttempt <= 2 || nowApprove - lastSellEditAt >= STATUS_THROTTLE_MS) {
             lastSellEditAt = nowApprove;
             await onStatus(
-              `⚙️ Step C/E — Approving exact JAGENT balance for PancakeSwap V2 Router${sellAttempt > 1 ? ` (attempt #${sellAttempt})` : ''}…\n` +
+              `⚙️ Step 3/5 (SELL) — Preparing exact token approval${sellAttempt > 1 ? ` (attempt #${sellAttempt})` : ''}…\n` +
               `Est. sell output: ~${Number(ethers.formatUnits(liveSellQuoteUsdtWei, TOKEN_DECIMALS)).toFixed(4)} USDT`,
             );
           }
@@ -1241,6 +1260,7 @@ export async function runFullExecution(
           if (jagentApproveReceipt.state === 'timeout') {
             throw new Error(`JAGENT approve TX ${sellApproveTxHash.slice(0, 12)}… confirmation timed out — verifying on-chain`);
           }
+          addReceiptGas(jagentApproveReceipt.receipt);
 
           await waitForAllowancePropagation(
             () => readJagentAllowance(walletAddress, ADDR.PANCAKE_ROUTER),
@@ -1271,7 +1291,7 @@ export async function runFullExecution(
         if (sellAttempt <= 2 || nowSell - lastSellEditAt >= STATUS_THROTTLE_MS) {
           lastSellEditAt = nowSell;
           await onStatus(
-            `⚙️ Step C/E — Selling 100% JAGENT → USDT on PancakeSwap V2${sellAttempt > 1 ? ` (attempt #${sellAttempt})` : ''}…\n` +
+            `⚙️ Step 3/5 (SELL) — Selling ALL minted tokens → USDT${sellAttempt > 1 ? ` (attempt #${sellAttempt})` : ''}…\n` +
             `Live quote: ~${Number(ethers.formatUnits(freshSellQuoteWei, TOKEN_DECIMALS)).toFixed(4)} USDT`,
           );
         }
@@ -1329,6 +1349,7 @@ export async function runFullExecution(
           throw new Error(`Step C sell TX ${sellTxHash.slice(0, 12)}… confirmation timed out — verifying on-chain`);
         }
 
+        addReceiptGas(sellReceipt.receipt);
         usdtReceivedWei = sellReceipt.usdtReceivedFromLogs;
         if (usdtReceivedWei === 0n) {
           const usdtAfterSell = await readUsdtBalance(walletAddress).catch(() => usdtBeforeSell);
@@ -1403,7 +1424,7 @@ export async function runFullExecution(
 
         if (leftoverAllowance === 0n) {
           if (revokeAttempt === 0) {
-            await onStatus('✅ Step D/E — USDT allowance is already 0 (no revoke needed).');
+            await onStatus('✅ Step 4/5 (REVOKE) — USDT allowance is already 0 (no revoke needed).');
           } else {
             if (!txHashes.revoke) revokeTxHash = 'confirmed-onchain (0)';
             logger.info({ userId, step: 'revoke_usdt', attempts: revokeAttempt }, 'USDT allowance confirmed 0 on-chain');
@@ -1423,7 +1444,7 @@ export async function runFullExecution(
         if (revokeAttempt <= 2 || now - lastRevokeEditAt >= STATUS_THROTTLE_MS) {
           lastRevokeEditAt = now;
           await onStatus(
-            `⚙️ Step D/E — Revoking leftover USDT approval (${Number(ethers.formatUnits(leftoverAllowance, TOKEN_DECIMALS)).toFixed(4)} USDT → 0)` +
+            `⚙️ Step 4/5 (REVOKE) — Revoking leftover USDT approval (${Number(ethers.formatUnits(leftoverAllowance, TOKEN_DECIMALS)).toFixed(4)} USDT → 0)` +
             `${revokeAttempt > 1 ? ` (attempt #${revokeAttempt})` : ''}…`,
           );
         }
@@ -1481,7 +1502,8 @@ export async function runFullExecution(
           throw new Error(`Step D revoke TX ${revokeTxHash.slice(0, 12)}… confirmation timed out — verifying on-chain`);
         }
 
-        logger.info({ userId, step: 'revoke_usdt', attempts: revokeAttempt, revokeTxHash }, 'Step D USDT revoke confirmed');
+        addReceiptGas(revokeReceipt.receipt);
+        logger.info({ userId, step: 'revoke_usdt', attempts: revokeAttempt, revokeTxHash }, 'Step 4/5 USDT revoke confirmed');
         break;
       } catch (err) {
         const e = err as Error & { isSessionExpired?: boolean };
@@ -1526,7 +1548,7 @@ export async function runFullExecution(
     // - If all 50 attempts do not succeed, does NOT stall or crash — records
     //   50/50 attempts and latest reason cleanly and proceeds to the final summary.
     // ═══════════════════════════════════════════════════════════════════════════
-    await onStatus(`⚙️ Step E/E — Checking & claiming referral reward (max ${CLAIM_MAX_ATTEMPTS} attempts)…`);
+    await onStatus(`⚙️ Step 5/5 (CLAIM) — Claiming 1 USDT invitee bonus & confirming receipt (max ${CLAIM_MAX_ATTEMPTS} attempts)…`);
 
     let claimTxHash = 'N/A';
     let inviteRewardUsdtStr: string | undefined;
@@ -1718,7 +1740,7 @@ export async function runFullExecution(
           }
 
           if (rewardStatus.rewardsPaused) {
-            lastClaimReason = 'invite rewards payouts paused on jager.live';
+            lastClaimReason = 'bonus payouts temporarily paused';
             logger.info(
               { userId, walletAddress, attempt, maxAttempts: CLAIM_MAX_ATTEMPTS, reason: lastClaimReason },
               'Step E referral claim attempt — rewards paused',
@@ -1882,6 +1904,14 @@ export async function runFullExecution(
     // ═══════════════════════════════════════════════════════════════════════════
     // Final Report & PostgreSQL Persistence
     // ═══════════════════════════════════════════════════════════════════════════
+    const bnbAfterCycle = await readBnbBalance(walletAddress).catch(() => null);
+    if (trackedGasWei === 0n && bnbBeforeCycle != null && bnbAfterCycle != null && bnbBeforeCycle > bnbAfterCycle) {
+      trackedGasWei = bnbBeforeCycle - bnbAfterCycle;
+    }
+    const totalGasBnbStr  = trackedGasWei > 0n
+      ? Number(ethers.formatEther(trackedGasWei)).toFixed(6)
+      : '0.000000';
+
     const mintCostUsdtF   = Number(ethers.formatUnits(actualMintCostUsdtWei, TOKEN_DECIMALS));
     const sellUsdtF       = Number(ethers.formatUnits(usdtReceivedWei, TOKEN_DECIMALS));
     const netLossOrFeeF   = sellUsdtF - mintCostUsdtF;
@@ -1909,11 +1939,13 @@ export async function runFullExecution(
       generateExecutionSummary({
         agentId: resolvedAgentId,
         walletAddress,
+        livePriceUsdt: livePriceUsedUsdt,
         mintCostUsdt: mintCostUsdtStr,
         tokensReceived: tokensStr,
         sellUsdt: sellUsdtStr,
         netLossOrFeeUsdt: netLossOrFeeStr,
         inviteRewardUsdt: inviteRewardUsdtStr,
+        totalGasBnb: totalGasBnbStr,
         approveTxHash,
         mintTxHash,
         sellApproveTxHash: sellApproveTxHash || undefined,
@@ -1934,11 +1966,13 @@ export async function runFullExecution(
       summary,
       agentId: resolvedAgentId,
       walletAddress,
+      livePriceUsdt: livePriceUsedUsdt,
       mintCostUsdt: mintCostUsdtStr,
       tokensReceived: tokensStr,
       sellUsdt: sellUsdtStr,
       netLossOrFeeUsdt: netLossOrFeeStr,
       inviteRewardUsdt: inviteRewardUsdtStr,
+      totalGasBnb: totalGasBnbStr,
       approveTxHash,
       mintTxHash,
       sellApproveTxHash: sellApproveTxHash || undefined,

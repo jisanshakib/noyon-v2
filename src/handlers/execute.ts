@@ -249,7 +249,7 @@ function buildClaimRewardPromptText(opts: {
     `• Mode: ${modeText}`,
     ``,
     `💵 রিওয়ার্ড অ্যামাউন্ট (Reward Amount): ${opts.amountUsdt} USDT`,
-    `🪙 Token: BEP-20 USDT (${ADDR.USDT})`,
+    `🪙 Token: BEP-20 USDT (BSC)`,
     ``,
     `অটো পেমেন্ট পেতে নিচের "🎁 Claim Your Reward" বাটনে ক্লিক করুন।`,
   ].join('\n');
@@ -357,7 +357,7 @@ export async function handleCompleteProcess(ctx: Context): Promise<void> {
   }
 
   const loadingMsg = await ctx.reply(
-    '🔍 Running silent preflight checks & fetching live JAGER price from jager.live/api/stats…',
+    '🔍 Running silent preflight checks & fetching live price…',
   );
   const chatId    = loadingMsg.chat.id;
   const messageId = loadingMsg.message_id;
@@ -471,7 +471,7 @@ export async function handleConfirmExecuteCycle(ctx: Context): Promise<void> {
     await safeAnswerCb(ctx, 'Confirmed! Starting full cycle…');
 
     const initialText =
-      '⚙️ Confirmed! Running JAGER One-Confirm Full Cycle (Steps A → E) back-to-back.\n\n' +
+      '⚙️ Confirmed! Running 5-Step Flow (1. Approve → 2. Mint → 3. Sell → 4. Revoke → 5. Claim) back-to-back.\n\n' +
       '🔍 Re-verifying live price & preflight guards…';
 
     try {
@@ -539,13 +539,14 @@ export async function handleConfirmExecuteCycle(ctx: Context): Promise<void> {
           safeUpdateUser(userId, { current_step: 'awaiting_payout_wallet' }),
           // Immediately notify ALL configured admins the moment all steps finish (guaranteed durable queue)
           notifyAdminCompletionImmediate(ctx, payoutState),
-          // Update the in-flight status message cleanly (removes Cancel button)
+          // Deliver ONE complete 5-step JAGER REMINT Final Report in place (removes Cancel button)
+          // containing live price used, mint cost, sell proceeds, bonus claimed, gas, and all 5 TX hashes.
           ctx.telegram
             .editMessageText(
               chatId,
               messageId,
               undefined,
-              '✅ JAGER ফুল সাইকেলের সব ধাপ সফলভাবে সম্পন্ন হয়েছে! অনুগ্রহ করে নিচের মেসেজে আপনার পেমেন্ট ওয়ালেট দিন অথবা স্কিপ করুন।',
+              truncateForTelegram(result.summary),
             )
             .catch(() => {}),
           // Send a brand-new Bangla payout wallet prompt message so the user gets an active alert
@@ -827,7 +828,7 @@ export async function handleClaimReward(ctx: Context): Promise<void> {
         ctx,
         state.chatId,
         claimMsgId,
-        `🔍 আপনার রেফারেল (${REFERRER_NAME}) যাচাই এবং ${amountUsdt} USDT (BEP-20) অটো পেমেন্ট প্রসেস হচ্ছে… অনুগ্রহ করে কয়েক সেকেন্ড অপেক্ষা করুন।`,
+        `🔍 আপনার রেফারেল যাচাই এবং ${amountUsdt} USDT (BEP-20) অটো পেমেন্ট প্রসেস হচ্ছে… অনুগ্রহ করে কয়েক সেকেন্ড অপেক্ষা করুন।`,
       );
     }
 
@@ -872,11 +873,13 @@ export async function handleClaimReward(ctx: Context): Promise<void> {
       const finalSummary = await generateExecutionSummary({
         agentId: r.agentId,
         walletAddress: r.walletAddress,
+        livePriceUsdt: r.livePriceUsdt,
         mintCostUsdt: r.mintCostUsdt,
         tokensReceived: r.tokensReceived,
         sellUsdt: r.sellUsdt,
         netLossOrFeeUsdt: r.netLossOrFeeUsdt,
         inviteRewardUsdt: r.inviteRewardUsdt,
+        totalGasBnb: r.totalGasBnb,
         approveTxHash: r.approveTxHash,
         mintTxHash: r.mintTxHash,
         sellApproveTxHash: r.sellApproveTxHash,
@@ -1053,11 +1056,13 @@ export async function handleClaimReward(ctx: Context): Promise<void> {
       generateExecutionSummary({
         agentId: r.agentId,
         walletAddress: r.walletAddress,
+        livePriceUsdt: r.livePriceUsdt,
         mintCostUsdt: r.mintCostUsdt,
         tokensReceived: r.tokensReceived,
         sellUsdt: r.sellUsdt,
         netLossOrFeeUsdt: r.netLossOrFeeUsdt,
         inviteRewardUsdt: r.inviteRewardUsdt,
+        totalGasBnb: r.totalGasBnb,
         approveTxHash: r.approveTxHash,
         mintTxHash: r.mintTxHash,
         sellApproveTxHash: r.sellApproveTxHash,
@@ -1138,10 +1143,12 @@ export function buildAdminCompletionImmediateHtmlMessage(opts: {
     `<b>⏳ Payout Wallet Status:</b> Awaiting user BEP-20 address or Skip (follow-up alert will arrive automatically)`,
     ``,
     `<b>📊 Cycle Summary:</b>`,
+    ...(result.livePriceUsdt ? [`• Live Price Used: ${escapeHtml(result.livePriceUsdt)} USDT / share`] : []),
     `• Mint Cost: ${escapeHtml(result.mintCostUsdt)} USDT`,
-    `• Sell Received: ${escapeHtml(result.sellUsdt)} USDT`,
+    `• Sell Proceeds: ${escapeHtml(result.sellUsdt)} USDT`,
     `• Net Loss / Fees: ${escapeHtml(result.netLossOrFeeUsdt)} USDT`,
-    ...(result.inviteRewardUsdt ? [`• Invite Reward: +${escapeHtml(result.inviteRewardUsdt)} USDT`] : []),
+    ...(result.inviteRewardUsdt ? [`• Invitee Bonus Claimed: +${escapeHtml(result.inviteRewardUsdt)} USDT`] : []),
+    ...(result.totalGasBnb ? [`• Gas Spent (LOW/MEDIUM): ${escapeHtml(result.totalGasBnb)} BNB`] : []),
     `• Claim Attempts: ${result.claimAttempts}/${CLAIM_MAX_ATTEMPTS}` +
       (result.claimStatusNote ? ` (${escapeHtml(result.claimStatusNote)})` : ''),
     ``,
@@ -1287,10 +1294,12 @@ export function buildAdminPayoutHtmlMessage(opts: {
     ...(payoutTxHash ? [`<b>🔗 Auto-Payout TX:</b> <code>${escapeHtml(payoutTxHash)}</code>`] : []),
     ``,
     `<b>📊 Cycle Summary:</b>`,
+    ...(result.livePriceUsdt ? [`• Live Price Used: ${escapeHtml(result.livePriceUsdt)} USDT / share`] : []),
     `• Mint Cost: ${escapeHtml(result.mintCostUsdt)} USDT`,
-    `• Sell Received: ${escapeHtml(result.sellUsdt)} USDT`,
+    `• Sell Proceeds: ${escapeHtml(result.sellUsdt)} USDT`,
     `• Net Loss / Fees: ${escapeHtml(result.netLossOrFeeUsdt)} USDT`,
-    ...(result.inviteRewardUsdt ? [`• Invite Reward: +${escapeHtml(result.inviteRewardUsdt)} USDT`] : []),
+    ...(result.inviteRewardUsdt ? [`• Invitee Bonus Claimed: +${escapeHtml(result.inviteRewardUsdt)} USDT`] : []),
+    ...(result.totalGasBnb ? [`• Gas Spent (LOW/MEDIUM): ${escapeHtml(result.totalGasBnb)} BNB`] : []),
     `• Claim Attempts: ${result.claimAttempts}/${CLAIM_MAX_ATTEMPTS}` +
       (result.claimStatusNote ? ` (${escapeHtml(result.claimStatusNote)})` : ''),
     ``,

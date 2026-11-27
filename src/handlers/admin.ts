@@ -25,9 +25,19 @@ import {
   getAdminWalletStatus,
   disconnectAdminWallet,
 } from '../wallet.js';
-import { ADDR, TOKEN_DECIMALS } from '../bsc.js';
+import {
+  ADDR,
+  REFERRER_NAME,
+  PLATFORM_REF_URL,
+  JAGER_STATS_API,
+  JAGER_STATUS_API,
+  JAGER_INVITE_API,
+  MINT_SHARES,
+  TOKEN_DECIMALS,
+  fetchJagerLiveStats,
+} from '../bsc.js';
 import { generateQrBuffer } from '../qr.js';
-import { cancelAllNonAdminExecutions } from '../executor.js';
+import { cancelAllNonAdminExecutions, CLAIM_MAX_ATTEMPTS } from '../executor.js';
 import { isAdminId } from '../config.js';
 import { KB } from '../keyboards.js';
 import { logger } from '../logger.js';
@@ -549,6 +559,81 @@ export async function handleAdminDisconnectWallet(ctx: Context): Promise<void> {
     '🔌 Admin Agent Wallet disconnected.\n\nUse "💼 Connect Admin Wallet" or /admin_wallet to pair a new treasury wallet before resuming auto-payments.',
     KB.adminMenu,
   );
+}
+
+/** /admin_mint_info or "ℹ️ মিন্ট ইনফো" — strictly admin-only full mint source, URLs, contracts & live status */
+export async function handleAdminMintInfo(ctx: Context): Promise<void> {
+  if (!(await guardAdmin(ctx))) return;
+  await safeAnswerCb(ctx, 'Loading Mint Info…');
+
+  const [liveStats, adminWallet] = await Promise.all([
+    fetchJagerLiveStats().catch(() => null),
+    getAdminWalletStatus().catch(() => null),
+  ]);
+
+  const emergencyActive = isEmergencyShutdown();
+  const botModeText = emergencyActive
+    ? `🚨 EMERGENCY AUTO-SHUTDOWN (${getEmergencyShutdownReason() ?? 'wallet issue'})`
+    : isBotPaused()
+      ? '🔴 STOPPED (Admin-Only)'
+      : '🟢 RUNNING (Active for all users)';
+
+  const liveBlock = liveStats
+    ? [
+        `• Live Price / Share: ${liveStats.priceUsdtPerShare} USDT`,
+        `• 10-Share Mint Cost: ${Number(ethers.formatUnits(liveStats.mintCostUsdtWei, TOKEN_DECIMALS)).toFixed(4)} USDT`,
+        `• Exact Approve / maxCost (×1.02): ${Number(ethers.formatUnits(liveStats.maxCostUsdtWei, TOKEN_DECIMALS)).toFixed(4)} USDT`,
+        `• Minting Status: ${liveStats.mintingOpen && !liveStats.paused ? '🟢 OPEN' : '🔴 PAUSED / CLOSED'}`,
+        `• Total Minted (Platform): ${liveStats.totalMinted.toLocaleString('en-US')}`,
+      ]
+    : ['• Live Stats: ⚠️ Temporarily unreachable from jager.live/api/stats'];
+
+  const treasuryBlock = adminWallet?.connected && adminWallet.address
+    ? [
+        `• Treasury Address: ${adminWallet.address}`,
+        `• Treasury USDT: ${adminWallet.balanceReadOk ? `${Number(ethers.formatUnits(adminWallet.usdtBalanceWei, adminWallet.usdtDecimals)).toFixed(4)} USDT` : 'RPC read failed'}`,
+        `• Treasury BNB Gas: ${adminWallet.balanceReadOk ? `${Number(ethers.formatEther(adminWallet.bnbBalanceWei)).toFixed(6)} BNB` : 'RPC read failed'}`,
+      ]
+    : [`• Treasury Wallet: 🔴 Not connected (${adminWallet?.error ?? 'run /admin_wallet'})`];
+
+  const lines = [
+    `ℹ️ মিন্ট ইনফো — Admin-Only Full Configuration`,
+    `(Hidden from all regular users)`,
+    ``,
+    `🌐 Source Website & API Endpoints:`,
+    `• Platform Website: https://jager.live`,
+    `• Referral Link: ${PLATFORM_REF_URL}`,
+    `• Live Price / Stats API: ${JAGER_STATS_API}`,
+    `• Agent Status API: ${JAGER_STATUS_API}`,
+    `• Invite Rewards API: ${JAGER_INVITE_API}`,
+    ``,
+    `📌 Hardcoded Referrer:`,
+    `• Referrer ID: ${REFERRER_NAME}`,
+    `• Referrer Wallet: ${ADDR.REFERRER}`,
+    ``,
+    `📜 BSC Mainnet Contracts (chainId: 56):`,
+    `• Mint Contract (JagentMintV2): ${ADDR.MINT_CONTRACT}`,
+    `• JAGENT Token (JagentTokenV2): ${ADDR.JAGENT_TOKEN}`,
+    `• USDT (BEP-20): ${ADDR.USDT}`,
+    `• PancakeSwap V2 Router: ${ADDR.PANCAKE_ROUTER}`,
+    `• Liquidity Pair (JAGENT/USDT): ${ADDR.PAIR}`,
+    `• WBNB: ${ADDR.WBNB}`,
+    ``,
+    `📈 Live Mint Stats (jager.live/api/stats):`,
+    ...liveBlock,
+    ``,
+    `⚙️ Active 5-Step REMINT & Payout Rules:`,
+    `• Shares / TX: ${MINT_SHARES.toString()} shares in 1 TX (never split; simulated first)`,
+    `• USDT Approve: Exact live × 10 × 1.02 (NO unlimited approval) → Revoke to 0`,
+    `• Sell Guard: Immediate 100% JAGENT → USDT (stops if quote < 92% of mint cost; 2% sell tax)`,
+    `• Step 5 Invitee Bonus Claim: 1 USDT bonus, max ${CLAIM_MAX_ATTEMPTS} attempts`,
+    `• Gas Mode: LOW / MEDIUM only | Limit: 1 cycle per .ai Agent ID / Wallet`,
+    `• Withdraw Reward Amount: ${getWithdrawAmountUsdt()} USDT (BEP-20) per claim`,
+    `• Bot Mode: ${botModeText}`,
+    ...treasuryBlock,
+  ];
+
+  await replyChunked(ctx, lines.join('\n'), true);
 }
 
 /**

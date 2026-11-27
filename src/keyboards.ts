@@ -14,7 +14,10 @@ export const KB = {
 
   /** Shown on /start ONLY for configured ADMIN_ID(s) — strict role isolation (no user execution buttons) */
   startForAdmin: Markup.inlineKeyboard([
-    [Markup.button.callback('🛡️ Admin Dashboard', 'admin_overview')],
+    [
+      Markup.button.callback('🛡️ Admin Dashboard', 'admin_overview'),
+      Markup.button.callback('ℹ️ মিন্ট ইনফো', 'admin_mint_info'),
+    ],
     [
       Markup.button.callback('💼 Connect Admin Wallet', 'admin_connect_wallet'),
       Markup.button.callback('💵 Adjust Withdraw Amount', 'admin_adjust_withdraw'),
@@ -33,7 +36,7 @@ export const KB = {
     ],
     [
       Markup.button.callback('👥 All Users', 'admin_users'),
-      Markup.button.callback('🔄 Refresh Overview', 'admin_overview'),
+      Markup.button.callback('ℹ️ মিন্ট ইনফো', 'admin_mint_info'),
     ],
     [
       Markup.button.callback('💼 Connect Admin Wallet', 'admin_connect_wallet'),
@@ -43,6 +46,7 @@ export const KB = {
       Markup.button.callback('⏸️ Stop Bot (Users)', 'admin_bot_stop'),
       Markup.button.callback('✅ Resume / Start Bot', 'admin_resume'),
     ],
+    [Markup.button.callback('🔄 Refresh Overview', 'admin_overview')],
   ]),
 
   /** Shown after wallet connection link is generated */

@@ -212,7 +212,7 @@ export async function fetchJagerLiveStats(): Promise<JagerLiveStats> {
 
   const priceNum = Number(raw.priceUsdtPerShare);
   if (!Number.isFinite(priceNum) || priceNum <= 0) {
-    throw new Error(`Invalid live priceUsdtPerShare from jager.live/api/stats: ${String(raw.priceUsdtPerShare)}`);
+    throw new Error(`Invalid live price received from price feed: ${String(raw.priceUsdtPerShare)}`);
   }
 
   // Convert exact decimal string to 18-decimal USDT wei without float rounding drift
@@ -350,7 +350,7 @@ export async function checkInviteRewards(rawWalletAddress: string): Promise<Invi
         ok: false,
         httpStatus: res.status,
         rateLimited,
-        error: rateLimited ? 'HTTP 429 rate-limited by jager.live' : `HTTP ${res.status} from jager.live/api/invite-rewards`,
+        error: rateLimited ? 'HTTP 429 rate-limited by reward service' : `HTTP ${res.status} from reward service`,
         pendingUsdt: 0,
         paidUsdt: 0,
         rewardsPaused: false,
@@ -774,10 +774,10 @@ export const MAX_CYCLES_PER_ID = 1;
 export const JAGER_ALREADY_COMPLETED_MESSAGE = [
   `⛔ আহা অশান্তি! একটা আইডি দিয়ে কতবার করতে চাচ্ছেন?`,
   ``,
-  `📌 নিয়ম (Per-ID Limit): প্রতি ১টি .ai Agent ID / Wallet দিয়ে JAGER Full Cycle সর্বোচ্চ ১ বারই (10 shares, 1 TX) করা যায়।`,
-  `এই .ai আইডি / ওয়ালেট দিয়ে ইতিমধ্যেই JAGER সাইকেল সম্পন্ন হয়েছে, তাই একই আইডি দিয়ে পুনরায় করা যাবে না।`,
+  `📌 নিয়ম (Per-ID Limit): প্রতি ১টি .ai Agent ID / Wallet দিয়ে এই ফুল সাইকেল সর্বোচ্চ ১ বারই (10 shares, 1 TX) করা যায়।`,
+  `এই .ai আইডি / ওয়ালেট দিয়ে ইতিমধ্যেই সাইকেল সম্পন্ন হয়েছে, তাই একই আইডি দিয়ে পুনরায় করা যাবে না।`,
   ``,
-  `(Limit: 1 full cycle per .ai Agent ID / Wallet on JAGER Mint Contract ${ADDR.MINT_CONTRACT.slice(0, 10)}…${ADDR.MINT_CONTRACT.slice(-4)} — already completed. Connect a fresh .ai wallet to run again.)`,
+  `(Limit: 1 full cycle per .ai Agent ID / Wallet — already completed. Connect a fresh .ai wallet to run again.)`,
 ].join('\n');
 
 export type FreshnessCode =
@@ -808,14 +808,13 @@ export function formatWalletNotEligibleMessage(
 ): string {
   const mintedStr    = (info?.minted ?? 0n).toString();
   const remainingStr = (info?.remaining ?? 0n).toString();
-  const shortMint    = `${ADDR.MINT_CONTRACT.slice(0, 10)}…${ADDR.MINT_CONTRACT.slice(-4)}`;
 
   switch (code) {
     case 'NO_AGENT_ID':
       return [
         `⛔ আপনার ওয়ালেট নট ইলিজিবল (Wallet Not Eligible)`,
         ``,
-        `এই ওয়ালেটে কোনো .ai Agent ID নেই। JAGER মিন্ট করার জন্য Binance App → Agentic Wallet থেকে একটি .ai Agent ID ক্লেইম করা বাধ্যতামূলক।`,
+        `এই ওয়ালেটে কোনো .ai Agent ID নেই। কাজ শুরু করার জন্য Binance App → Agentic Wallet থেকে একটি .ai Agent ID ক্লেইম করা বাধ্যতামূলক।`,
         ``,
         `(Wallet Not Eligible: No .ai Agent ID owned by this wallet on BSC. Claim a .ai Agent ID in Binance App → Agentic Wallet first.)`,
       ].join('\n');
@@ -824,10 +823,10 @@ export function formatWalletNotEligibleMessage(
       return [
         `⛔ আপনার ওয়ালেট নট ইলিজিবল (Wallet Not Eligible)`,
         ``,
-        `এই .ai আইডি / ওয়ালেট দিয়ে ইতিমধ্যেই JAGER কন্ট্রাক্টে মিন্ট করা হয়ে গেছে (minted: ${mintedStr}, remaining: ${remainingStr})।`,
-        `📌 নিয়ম (Per-ID Limit): প্রতি ১টি .ai Agent ID / Wallet দিয়ে JAGER Full Cycle সর্বোচ্চ ১ বারই (10 shares, 1 TX) করা যায় — এবং শুধুমাত্র ফ্রেশ ওয়ালেট (minted == 0, remaining >= 10) ইলিজিবল।`,
+        `এই .ai আইডি / ওয়ালেট দিয়ে ইতিমধ্যেই মিন্ট করা হয়ে গেছে (minted: ${mintedStr}, remaining: ${remainingStr})।`,
+        `📌 নিয়ম (Per-ID Limit): প্রতি ১টি .ai Agent ID / Wallet দিয়ে ফুল সাইকেল সর্বোচ্চ ১ বারই (10 shares, 1 TX) করা যায় — এবং শুধুমাত্র ফ্রেশ ওয়ালেট (minted == 0, remaining >= 10) ইলিজিবল।`,
         ``,
-        `(Wallet Not Eligible: Already minted on JAGER contract ${shortMint}. Limit is 1 time per ID/wallet and requires a fresh wallet with minted == 0 and remaining >= 10.)`,
+        `(Wallet Not Eligible: Already completed on this wallet. Limit is 1 time per ID/wallet and requires a fresh wallet with minted == 0 and remaining >= 10.)`,
       ].join('\n');
 
     case 'INSUFFICIENT_QUOTA':
@@ -837,20 +836,20 @@ export function formatWalletNotEligibleMessage(
         `এই আইডির পর্যাপ্ত মিন্ট কোটা নেই (minted: ${mintedStr}, remaining: ${remainingStr} — এক ট্রানজেকশনে ১০ শেয়ার মিন্ট করার জন্য কমপক্ষে remaining >= 10 প্রয়োজন)।`,
         `📌 নিয়ম (Per-ID Limit): প্রতি ১টি .ai Agent ID / Wallet দিয়ে ১০ শেয়ার একবারে (1 TX) মিন্ট করতে হয় (সর্বোচ্চ ১ বার)।`,
         ``,
-        `(Wallet Not Eligible: Remaining quota is ${remainingStr}, need >= 10 shares in one transaction on JAGER contract ${shortMint}.)`,
+        `(Wallet Not Eligible: Remaining quota is ${remainingStr}, need >= 10 shares in one transaction.)`,
       ].join('\n');
 
     case 'MINT_PAUSED':
       return [
-        `⛔ JAGER মিন্টিং বর্তমানে বন্ধ/পজ আছে (Minting Paused / Closed)`,
+        `⛔ মিন্টিং বর্তমানে বন্ধ/পজ আছে (Minting Paused / Closed)`,
         ``,
-        `jager.live অথবা JAGER মিন্ট কন্ট্রাক্টে মিন্টিং এই মুহূর্তে বন্ধ আছে। অনুগ্রহ করে পরে আবার চেষ্টা করুন।`,
+        `মিন্টিং এই মুহূর্তে সাময়িকভাবে বন্ধ আছে। অনুগ্রহ করে পরে আবার চেষ্টা করুন।`,
       ].join('\n');
 
     case 'CHECK_UNAVAILABLE':
     default:
       return [
-        `⚠️ এই মুহূর্তে JAGER কন্ট্রাক্ট থেকে ওয়ালেট ইলিজিবিলিটি যাচাই করা যায়নি।`,
+        `⚠️ এই মুহূর্তে ওয়ালেট ইলিজিবিলিটি যাচাই করা যায়নি।`,
         ``,
         `অনুগ্রহ করে একটু পর আবার চেষ্টা করুন।` + (info?.detail ? `\n(${info.detail})` : ''),
       ].join('\n');
@@ -880,7 +879,7 @@ export async function checkWalletFreshness(rawWalletAddress: string): Promise<Wa
       return {
         fresh: false,
         reasonCode: 'MINT_PAUSED',
-        reason: 'JAGER minting is currently paused or closed on jager.live.',
+        reason: 'Minting is currently paused or closed. Please try again later.',
         userMessage: formatWalletNotEligibleMessage('MINT_PAUSED'),
         minted: onChain.mintedCount,
         quota: onChain.quota,
@@ -914,7 +913,7 @@ export async function checkWalletFreshness(rawWalletAddress: string): Promise<Wa
     const paidOnce  = onChain.available ? onChain.paidOnce       : minted > 0n;
 
     if (!onChain.available && !apiStatus) {
-      const detail = 'Could not verify wallet eligibility from BSC or jager.live.';
+      const detail = 'Could not verify wallet eligibility at the moment. Please try again shortly.';
       return {
         fresh: false,
         reasonCode: 'CHECK_UNAVAILABLE',
@@ -1090,7 +1089,7 @@ export async function simulateSellOutputUsdt(
 
   logger.warn({ err: (lastErr as Error)?.message }, 'simulateSellOutputUsdt RPC failed');
   if (opts?.throwOnRpcError) {
-    throw new Error(`PancakeSwap V2 sell quote RPC error: ${(lastErr as Error)?.message ?? String(lastErr)}`);
+    throw new Error(`Market sell quote RPC error: ${(lastErr as Error)?.message ?? String(lastErr)}`);
   }
   return 0n;
 }
@@ -1110,7 +1109,7 @@ export function evaluateSellQuoteGuard(
     return {
       ok: false,
       lossPct: 100,
-      reason: 'Could not obtain a valid PancakeSwap V2 JAGENT → USDT sell quote (quote returned 0 USDT).',
+      reason: 'Could not obtain a valid market sell quote (quote returned 0 USDT).',
     };
   }
 

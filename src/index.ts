@@ -42,6 +42,7 @@ import {
   handleAdminConnectWallet,
   handleAdminDisconnectWallet,
   handleAdminAdjustWithdraw,
+  handleAdminMintInfo,
 } from './handlers/admin.js';
 import { handleMessage }       from './handlers/message.js';
 
@@ -89,6 +90,7 @@ bot.command('my_jobs',          handleMyJobs);          // Personal status alias
 
 // Admin-only commands (strictly gated by config.ADMIN_IDS inside handlers)
 bot.command('admin',                   handleAdminOverview);
+bot.command('admin_mint_info',         handleAdminMintInfo);
 bot.command('admin_users',             handleAdminUsers);
 bot.command('admin_completed',         handleAdminCompleted);
 bot.command('admin_incomplete',        handleAdminIncomplete);
@@ -115,6 +117,7 @@ bot.action('cancel',                handleCancel);
 
 // Admin-only inline button callbacks (strictly gated inside handlers)
 bot.action('admin_overview',        handleAdminOverview);
+bot.action('admin_mint_info',       handleAdminMintInfo);
 bot.action('admin_users',           handleAdminUsers);
 bot.action('admin_completed',       handleAdminCompleted);
 bot.action('admin_incomplete',      handleAdminIncomplete);

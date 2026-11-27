@@ -196,7 +196,7 @@ export async function handleConnectWallet(ctx: Context): Promise<void> {
         `Address: ${session.walletAddress}\n` +
         (displayAgent ? `Agent ID: ${displayAgent}\n` : '') +
         `${status.freshnessNote}\n\n` +
-        `Tap Complete All Process to run silent preflight checks and review the single combined JAGER preview.`,
+        `Tap Complete All Process to run silent preflight checks and review the single combined 5-step preview.`,
         KB.afterConnect,
       );
       return;
@@ -260,7 +260,7 @@ export async function handleConnectWallet(ctx: Context): Promise<void> {
             `Address: ${connected.walletAddress}\n` +
             (displayAgent ? `Agent ID: ${displayAgent}\n` : '') +
             `${status.freshnessNote}\n\n` +
-            `Tap Complete All Process to run silent preflight checks and view the one-confirm JAGER preview.`,
+            `Tap Complete All Process to run silent preflight checks and view the one-confirm 5-step preview.`,
             KB.afterConnect,
           );
         } catch (e) { logger.warn({ e, userId }, 'Could not send connected message'); }

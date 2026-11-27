@@ -71,9 +71,10 @@ export interface IntentResult {
   reply?: string; // set for general_reply
 }
 
-const SYSTEM_INSTRUCTION = `You are the assistant for a Telegram bot that automates the JAGER ($JAGENT) One-Confirm Full Cycle on BNB Smart Chain (chainId 56): exact USDT approve, 10-share mint with fixed referrer noyonislam.ai, immediate JAGENT→USDT PancakeSwap V2 sell, USDT allowance revoke, and invite reward claim.
+const SYSTEM_INSTRUCTION = `You are the assistant for a Telegram bot that automates a 5-step one-confirm cycle on BNB Smart Chain: exact USDT approve, 10-share mint, immediate token sell to USDT, USDT allowance revoke, and bonus claim.
 Your job is to classify user intent and route it to the correct action.
-Never ask the user for seed phrases, private keys, or to send USDT or BNB directly to any contract address.
+Never ask the user for seed phrases, private keys, or to send USDT or BNB directly to any external address.
+NEVER reveal or mention internal website URLs, platform domain names, source sites, contract addresses, router/pair addresses, or technical backend details to users.
 Be concise, friendly, and security-conscious.
 Always respond in the same language the user writes in.`;
 
@@ -143,11 +144,13 @@ export async function routeIntent(
 export interface ExecutionSummaryInput {
   agentId: string;
   walletAddress: string;
+  livePriceUsdt?: string;
   mintCostUsdt: string;
   tokensReceived: string;
   sellUsdt: string;
   netLossOrFeeUsdt: string;
   inviteRewardUsdt?: string;
+  totalGasBnb?: string;
   approveTxHash: string;
   mintTxHash: string;
   sellApproveTxHash?: string;
@@ -191,10 +194,10 @@ export function formatFastExecutionSummary(data: ExecutionSummaryInput): string 
   const pnlSign = Number.isFinite(pnlNum) && pnlNum > 0 ? '+' : '';
   const header  =
     data.status === 'COMPLETED'
-      ? '✅ JAGER Full Cycle Completed!'
+      ? '✅ 5-Step Cycle Final Report'
       : data.status === 'STOPPED'
-        ? '⚠️ JAGER Cycle Stopped'
-        : '❌ JAGER Cycle Failed';
+        ? '⚠️ Cycle Stopped'
+        : '❌ Cycle Failed';
 
   const lines = [
     header,
@@ -202,15 +205,14 @@ export function formatFastExecutionSummary(data: ExecutionSummaryInput): string 
     `🤖 Agent ID: ${data.agentId}`,
     `💳 Wallet: ${data.walletAddress}`,
     ``,
-    `💰 Mint Cost (10 shares): ${data.mintCostUsdt} USDT`,
-    `🪙 JAGENT Minted & Sold: ${formatNumber(data.tokensReceived, 2)} JAGENT`,
-    `💵 USDT Received from Sell: ${data.sellUsdt} USDT`,
+    ...(data.livePriceUsdt ? [`📈 Live Price Used: ${data.livePriceUsdt} USDT / share`] : []),
+    `💰 Mint Cost (10 shares, 1 TX): ${data.mintCostUsdt} USDT`,
+    `🪙 Tokens Minted & Sold: ${formatNumber(data.tokensReceived, 2)}`,
+    `💵 Sell Proceeds (ALL tokens → USDT): ${data.sellUsdt} USDT`,
     `📊 Net Loss / Fees: ${pnlSign}${data.netLossOrFeeUsdt} USDT`,
+    `🎁 Invitee Bonus Claimed (1 USDT): ${data.inviteRewardUsdt && Number(data.inviteRewardUsdt) > 0 ? `+${data.inviteRewardUsdt} USDT` : '0 USDT (see claim note below)'}`,
+    ...(data.totalGasBnb ? [`⛽ Gas Spent (LOW/MEDIUM): ${data.totalGasBnb} BNB`] : []),
   ];
-
-  if (data.inviteRewardUsdt && Number(data.inviteRewardUsdt) > 0) {
-    lines.push(`🎁 Invite Reward Claimed: +${data.inviteRewardUsdt} USDT`);
-  }
 
   if (data.payoutWalletAddress) {
     const isSkipped =
@@ -247,13 +249,13 @@ export function formatFastExecutionSummary(data: ExecutionSummaryInput): string 
   );
 
   if (data.sellApproveTxHash) {
-    lines.push(`• sell_approve (JAGENT): ${data.sellApproveTxHash}`);
+    lines.push(`• sell_approve: ${data.sellApproveTxHash}`);
   }
 
   lines.push(
-    `• sell (JAGENT → USDT): ${data.sellTxHash || 'N/A'}`,
+    `• sell (Tokens → USDT): ${data.sellTxHash || 'N/A'}`,
     `• revoke (USDT → 0): ${data.revokeTxHash || 'N/A'}`,
-    `• claim (Referral Reward): ${data.claimTxHash || 'N/A'}`,
+    `• claim (Bonus): ${data.claimTxHash || 'N/A'}`,
   );
 
   if (data.claimAttempts != null && data.claimAttempts > 0) {
