@@ -718,7 +718,7 @@ export async function runFullExecution(
         if (liveBnbBal < MIN_BNB_GAS) {
           return await stopNow(
             'STOPPED',
-            `Insufficient BNB for gas. Need ≥ ${ethers.formatEther(MIN_BNB_GAS)} BNB, have ${ethers.formatEther(liveBnbBal)} BNB.`,
+            `Insufficient network fee / gas fee (BNB). Need ≥ ${ethers.formatEther(MIN_BNB_GAS)} BNB, have ${ethers.formatEther(liveBnbBal)} BNB.`,
           );
         }
 
@@ -912,10 +912,10 @@ export async function runFullExecution(
             `have ${Number(ethers.formatUnits(liveUsdtBal, TOKEN_DECIMALS)).toFixed(4)} USDT.`,
           );
         }
-        if (liveBnbBal < MIN_BNB_GAS) {
+        if (liveBnbBal === 0n) {
           return await stopNow(
             'STOPPED',
-            `Insufficient BNB for mint gas. Need ≥ ${ethers.formatEther(MIN_BNB_GAS)} BNB, have ${ethers.formatEther(liveBnbBal)} BNB.`,
+            `Insufficient network fee / gas fee (BNB) for mint (have 0 BNB).`,
           );
         }
 
@@ -1180,10 +1180,10 @@ export async function runFullExecution(
         soldAmountWei    = liveJagentBal;
         trackedTokensWei = liveJagentBal;
 
-        if (liveBnbBal < MIN_BNB_GAS / 2n) {
+        if (liveBnbBal === 0n) {
           return await stopNow(
             'STOPPED',
-            `Insufficient BNB for Step C sell gas (have ${ethers.formatEther(liveBnbBal)} BNB).`,
+            `Insufficient network fee / gas fee (BNB) for Step 3 sell (have 0 BNB).`,
           );
         }
 
@@ -1432,10 +1432,10 @@ export async function runFullExecution(
           break;
         }
 
-        if (liveBnbBal < MIN_BNB_GAS / 3n) {
+        if (liveBnbBal === 0n) {
           return await stopNow(
             'STOPPED',
-            `Insufficient BNB for Step D USDT revoke gas (have ${ethers.formatEther(liveBnbBal)} BNB).`,
+            `Insufficient network fee / gas fee (BNB) for Step 4 USDT revoke (have 0 BNB).`,
           );
         }
 

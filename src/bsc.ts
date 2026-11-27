@@ -82,9 +82,9 @@ export const JAGENT_MINT_PRICE_BPS = 9_900n;
 /** BSC USDT & JAGENT both use 18 decimals. */
 export const TOKEN_DECIMALS        = 18;
 
-/** Minimum BNB required for LOW/MEDIUM gas across the 4-5 cycle transactions. */
-export const MIN_BNB_GAS              = ethers.parseEther('0.003');
-export const RECOMMENDED_BNB_GAS      = ethers.parseEther('0.005');
+/** Minimum BNB required in preflight for LOW/MEDIUM gas. */
+export const MIN_BNB_GAS              = ethers.parseEther('0.001');
+export const RECOMMENDED_BNB_GAS      = ethers.parseEther('0.001');
 /** Minimum BNB gas required on Admin Agent Wallet to send an ERC-20 BEP-20 USDT transfer. */
 export const MIN_ADMIN_PAYOUT_BNB_GAS = ethers.parseEther('0.0005');
 
@@ -1369,7 +1369,7 @@ export async function runPreflightChecks(
     };
   }
 
-  // 4. BNB gas balance check (LOW/MEDIUM gas)
+  // 4. BNB gas balance check (minimum 0.001 BNB in preflight)
   if (bnbBal < MIN_BNB_GAS) {
     return {
       ok: false,
@@ -1380,8 +1380,7 @@ export async function runPreflightChecks(
       quota: freshness.quota,
       remainingQuota: freshness.remaining,
       reason:
-        `Insufficient BNB for gas. Need ≥ ${ethers.formatEther(MIN_BNB_GAS)} BNB ` +
-        `(recommended ${ethers.formatEther(RECOMMENDED_BNB_GAS)} BNB for LOW/MEDIUM gas), ` +
+        `Insufficient network fee / gas fee (BNB). Need ≥ ${ethers.formatEther(MIN_BNB_GAS)} BNB, ` +
         `have ${ethers.formatEther(bnbBal)} BNB.`,
     };
   }
