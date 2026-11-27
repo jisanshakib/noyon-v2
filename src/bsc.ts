@@ -223,12 +223,19 @@ export async function fetchJagerLiveStats(): Promise<JagerLiveStats> {
   const pricePerShareWei = ethers.parseUnits(priceStr, TOKEN_DECIMALS);
   const apiCost10Wei     = pricePerShareWei * MINT_SHARES;
 
-  // Cross-check on-chain costOf(10) in case a price tier just ticked over
+  // Cross-check on-chain costOf(10), paused(), and opened() live (NO caching) so
+  // API metadata flags can never falsely report paused/closed when the on-chain contract is open.
   let onChainCost10Wei = 0n;
+  let onChainPaused: boolean | null = null;
+  let onChainOpened: boolean | null = null;
   try {
-    onChainCost10Wei = await readCostOf(MINT_SHARES);
+    [onChainCost10Wei, onChainPaused, onChainOpened] = await Promise.all([
+      readCostOf(MINT_SHARES).catch(() => 0n),
+      readMintPaused().catch(() => null),
+      readMintOpened().catch(() => null),
+    ]);
   } catch (err) {
-    logger.warn({ err: (err as Error)?.message }, 'readCostOf(10) fallback to API live price');
+    logger.warn({ err: (err as Error)?.message }, 'on-chain live stats cross-check fallback to API');
   }
 
   const mintCostUsdtWei = onChainCost10Wei > apiCost10Wei ? onChainCost10Wei : apiCost10Wei;
@@ -236,8 +243,8 @@ export async function fetchJagerLiveStats(): Promise<JagerLiveStats> {
 
   const tokensPerShare = Number(raw.tokensPerShare ?? 0);
   const totalMinted    = Number(raw.totalMinted ?? 0);
-  const mintingOpen    = raw.mintingOpen !== false;
-  const paused         = raw.paused === true;
+  const paused         = onChainPaused !== null ? onChainPaused : raw.paused === true;
+  const mintingOpen    = onChainOpened !== null ? (onChainOpened && !paused) : (raw.mintingOpen !== false && !paused);
   const sharesPerMint  = Number(raw.sharesPerMint ?? 10);
   const pairAddress    = typeof raw.pair === 'string' && /^0x[0-9a-fA-F]{40}$/.test(raw.pair)
     ? normalizeAddress(raw.pair, 'stats.pair')
@@ -459,6 +466,10 @@ export async function readTotalMinted(): Promise<bigint> {
 
 export async function readMintPaused(): Promise<boolean> {
   return Boolean(await mintContract().paused());
+}
+
+export async function readMintOpened(): Promise<boolean> {
+  return Boolean(await mintContract().opened());
 }
 
 let cachedUsdtDecimals: number | null = null;
@@ -869,13 +880,33 @@ export async function checkWalletFreshness(rawWalletAddress: string): Promise<Wa
   const walletAddress = normalizeAddress(rawWalletAddress, 'checkWalletFreshness.walletAddress');
 
   try {
-    const [onChain, apiStatus, paused] = await Promise.all([
+    const [onChain, apiStatus, onChainPaused, onChainOpened] = await Promise.all([
       readOnChainAgentQuota(walletAddress),
       fetchJagerAgentStatus(walletAddress),
-      readMintPaused().catch(() => false),
+      readMintPaused().catch(() => null),
+      readMintOpened().catch(() => null),
     ]);
 
-    if (paused || apiStatus?.open === false || apiStatus?.siteEntryOpen === false) {
+    // Authoritative live pause/open check directly against on-chain JagentMintV2 (`paused()`, `opened()`).
+    // IMPORTANT: Do NOT block on `apiStatus.siteEntryOpen === false` — that flag only indicates
+    // whether the external web UI builds transactions, NOT whether the BSC contract itself is paused.
+    const contractPausedOrClosed =
+      onChainPaused === true ||
+      onChainOpened === false ||
+      (onChainPaused === null && onChainOpened === null && apiStatus?.open === false);
+
+    if (contractPausedOrClosed) {
+      logger.warn(
+        {
+          walletAddress,
+          mintContract: ADDR.MINT_CONTRACT,
+          onChainPaused,
+          onChainOpened,
+          apiOpen: apiStatus?.open ?? null,
+          apiSiteEntryOpen: apiStatus?.siteEntryOpen ?? null,
+        },
+        'Minting blocked: contract is genuinely paused or closed on-chain',
+      );
       return {
         fresh: false,
         reasonCode: 'MINT_PAUSED',

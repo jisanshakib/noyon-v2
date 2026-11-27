@@ -49,7 +49,7 @@ async function checkConnectedWalletStatus(
   walletAddress: string,
   agentIdName?: string,
 ): Promise<
-  | { blocked: true; message: string; keyboard: typeof KB.start }
+  | { blocked: true; message: string; keyboard: typeof KB.start; keepSession?: boolean }
   | { blocked: false; resolvedAgentId?: string; freshnessNote: string }
 > {
   const [localCompleted, freshness] = await Promise.all([
@@ -113,8 +113,9 @@ async function checkConnectedWalletStatus(
     );
     return {
       blocked: true,
-      message: freshness.userMessage ?? `⛔ আপনার ওয়ালেট নট ইলিজিবল (Wallet Not Eligible)\n\n${freshness.reason ?? 'Wallet does not meet JAGER eligibility requirements.'}`,
+      message: freshness.userMessage ?? `⛔ আপনার ওয়ালেট নট ইলিজিবল (Wallet Not Eligible)\n\n${freshness.reason ?? 'Wallet does not meet eligibility requirements.'}`,
       keyboard: KB.start,
+      keepSession: freshness.reasonCode === 'MINT_PAUSED' || freshness.reasonCode === 'CHECK_UNAVAILABLE',
     };
   }
 
@@ -178,6 +179,10 @@ export async function handleConnectWallet(ctx: Context): Promise<void> {
     if (session.walletAddress) {
       const status = await checkConnectedWalletStatus(userId, session.walletAddress, session.agentIdName);
       if (status.blocked) {
+        if (status.keepSession) {
+          await ctx.reply(status.message, KB.afterConnect);
+          return;
+        }
         // Automatically sign out the completed/ineligible wallet so the user can immediately
         // pair a different eligible .ai Agent ID / wallet on their next tap.
         try { await clearSession(userId); } catch { /* ignore */ }
@@ -243,6 +248,10 @@ export async function handleConnectWallet(ctx: Context): Promise<void> {
             connected.agentIdName,
           );
           if (status.blocked) {
+            if (status.keepSession) {
+              await ctx.reply(status.message, KB.afterConnect);
+              return;
+            }
             // Automatically clear blocked/already-completed wallet so user can pair a fresh .ai wallet right away
             try { await clearSession(userId); } catch { /* ignore */ }
             try { await resetUserWalletBinding(userId); } catch { /* ignore */ }
