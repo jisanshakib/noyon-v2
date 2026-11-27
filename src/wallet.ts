@@ -20,15 +20,22 @@ import * as fs      from 'fs';
 import { ethers }   from 'ethers';
 import { config }   from './config.js';
 import { logger }   from './logger.js';
-import { pool, setAdminWalletConfig, getAdminWalletConfig } from './db.js';
+import {
+  pool,
+  setAdminWalletConfig,
+  getAdminWalletConfig,
+  saveAdminWalletSessionBundle,
+  loadAdminWalletSessionBundle,
+  clearAdminWalletSessionBundle,
+} from './db.js';
 import {
   ADDR,
   MIN_ADMIN_PAYOUT_BNB_GAS,
   TOKEN_DECIMALS,
   buildUsdtTransferCalldata,
   pollTransactionReceipt,
-  readBnbBalance,
-  readUsdtBalance,
+  readBnbBalanceResilient,
+  readUsdtBalanceResilient,
   readUsdtDecimals,
   simulateContractCall,
 } from './bsc.js';
@@ -170,14 +177,20 @@ export async function callBaw(
       if (code !== 0) {
         // Surface the most useful part of the error
         const detail = stderr.trim() || stdout.trim();
+        const isTransientNetwork =
+          /ETIMEDOUT|ECONNRESET|ECONNREFUSED|ENOTFOUND|EAI_AGAIN|fetch failed|socket hang up|network error|tls|certificate|502|503|504|429|rate.?limit/i.test(detail);
         const isExpired =
+          !isTransientNetwork &&
           /SESSION_EXPIRED|UNCONNECTED|TOKEN_EXPIRED|LOGIN_EXPIRED|INVALID_SESSION|not.*logged|not.*signed.?in|please sign in|unauthorized/i.test(detail);
+        const shortDetail = detail.replace(/\s+/g, ' ').slice(0, 260);
         const err = new Error(
           isExpired
-            ? 'SESSION_EXPIRED: Binance Wallet session has expired. Please reconnect.'
-            : `baw error (${code}): ${detail.slice(0, 300)}`,
-        );
-        (err as Error & { isSessionExpired?: boolean }).isSessionExpired = isExpired;
+            ? `SESSION_EXPIRED: Binance Wallet session expired/disconnected (${shortDetail || 'no local session'})`
+            : `baw error (${code}): ${shortDetail}`,
+        ) as Error & { isSessionExpired?: boolean; isTransientNetwork?: boolean; rawDetail?: string };
+        err.isSessionExpired = isExpired;
+        err.isTransientNetwork = isTransientNetwork;
+        err.rawDetail = shortDetail;
         return reject(err);
       }
       const trimmed = stdout.trim();
@@ -923,10 +936,116 @@ export async function executeContractCallForSession(opts: {
 
 // ─── Admin Agent Wallet (Treasury for BEP-20 USDT Auto-Payments) ─────────────
 
+function getAdminSessionDir(): string {
+  return path.join(config.BAW_SESSION_ROOT, ADMIN_WALLET_SESSION_KEY);
+}
+
+function listFilesRecursive(rootDir: string, currentDir = rootDir, acc: string[] = []): string[] {
+  if (!fs.existsSync(currentDir)) return acc;
+  for (const entry of fs.readdirSync(currentDir, { withFileTypes: true })) {
+    const full = path.join(currentDir, entry.name);
+    if (entry.isDirectory()) {
+      listFilesRecursive(rootDir, full, acc);
+    } else if (entry.isFile()) {
+      acc.push(path.relative(rootDir, full));
+    }
+    if (acc.length >= 50) break;
+  }
+  return acc;
+}
+
+/**
+ * Snapshots the local `admin-treasury` baw session files into PostgreSQL `bot_settings`
+ * so Railway container redeploys / restarts never wipe the Admin Agent Wallet session.
+ */
+export async function persistAdminWalletSessionToDb(): Promise<boolean> {
+  try {
+    const dir = getAdminSessionDir();
+    const relFiles = listFilesRecursive(dir);
+    if (relFiles.length === 0) return false;
+
+    const files: Record<string, string> = {};
+    let totalBytes = 0;
+    for (const rel of relFiles) {
+      const buf = fs.readFileSync(path.join(dir, rel));
+      totalBytes += buf.length;
+      if (totalBytes > 512 * 1024) break;
+      const posixRel = rel.split(path.sep).join('/');
+      files[posixRel] = buf.toString('base64');
+    }
+    if (Object.keys(files).length === 0) return false;
+
+    const bundle = JSON.stringify({ v: 1, savedAt: Date.now(), files });
+    const ok = await saveAdminWalletSessionBundle(bundle);
+    logger.info(
+      { fileCount: Object.keys(files).length, totalBytes, persisted: ok },
+      'Persisted admin-treasury baw session bundle to DB',
+    );
+    return ok;
+  } catch (err) {
+    logger.warn({ err: (err as Error)?.message }, 'persistAdminWalletSessionToDb failed');
+    return false;
+  }
+}
+
+/**
+ * Restores the `admin-treasury` baw session directory from PostgreSQL `bot_settings`
+ * whenever the local container directory is missing or empty (e.g. after Railway redeploy).
+ */
+export async function restoreAdminWalletSessionFromDb(force = false): Promise<boolean> {
+  try {
+    const dir = getAdminSessionDir();
+    if (!force && listFilesRecursive(dir).length > 0) {
+      return false; // local files already present
+    }
+    const raw = await loadAdminWalletSessionBundle();
+    if (!raw) return false;
+
+    const parsed = JSON.parse(raw) as { v?: number; files?: Record<string, string> };
+    if (!parsed?.files || typeof parsed.files !== 'object') return false;
+
+    fs.mkdirSync(dir, { recursive: true });
+    const resolvedRoot = path.resolve(dir);
+    let restoredCount = 0;
+
+    for (const [relPosix, b64] of Object.entries(parsed.files)) {
+      if (typeof b64 !== 'string' || !relPosix || relPosix.includes('..') || path.isAbsolute(relPosix)) {
+        continue;
+      }
+      const targetPath = path.resolve(resolvedRoot, ...relPosix.split('/'));
+      if (!targetPath.startsWith(resolvedRoot + path.sep)) continue;
+      fs.mkdirSync(path.dirname(targetPath), { recursive: true });
+      fs.writeFileSync(targetPath, Buffer.from(b64, 'base64'), { mode: 0o600 });
+      restoredCount++;
+    }
+
+    if (restoredCount > 0) {
+      logger.info({ restoredCount, dir }, 'Restored admin-treasury baw session bundle from DB onto disk');
+      return true;
+    }
+    return false;
+  } catch (err) {
+    logger.warn({ err: (err as Error)?.message }, 'restoreAdminWalletSessionFromDb failed');
+    return false;
+  }
+}
+
+/** Called once during startup right after `initDb()` to restore Admin Agent Wallet across Railway redeploys. */
+export async function restoreAdminWalletSessionOnStartup(): Promise<void> {
+  const restored = await restoreAdminWalletSessionFromDb(false);
+  if (restored) {
+    // Verify restored session silently in background so memory cache is warm
+    void refreshAdminWalletSessionFromBaw().catch((err) => {
+      logger.warn({ err: (err as Error)?.message }, 'Restored admin-treasury session verification failed');
+    });
+  }
+}
+
 async function refreshAdminWalletSessionFromBaw(): Promise<WalletSession | null> {
+  await restoreAdminWalletSessionFromDb(false);
   try {
     const addrRaw = unwrap(
-      (await callBaw(['wallet', 'address'], ADMIN_WALLET_SESSION_KEY, 12_000)) as Record<string, unknown>,
+      (await callBaw(['wallet', 'address'], ADMIN_WALLET_SESSION_KEY, 15_000)) as Record<string, unknown>,
     );
     const walletAddress = extractBscAddress(addrRaw);
     if (!walletAddress) return null;
@@ -938,7 +1057,10 @@ async function refreshAdminWalletSessionFromBaw(): Promise<WalletSession | null>
       walletAddress,
     };
     adminWalletSession = session;
-    await setAdminWalletConfig(walletAddress, true);
+    await Promise.all([
+      setAdminWalletConfig(walletAddress, true),
+      persistAdminWalletSessionToDb(),
+    ]);
     return session;
   } catch (err) {
     const e = err as Error & { isSessionExpired?: boolean };
@@ -948,6 +1070,7 @@ async function refreshAdminWalletSessionFromBaw(): Promise<WalletSession | null>
 }
 
 export async function generateAdminWalletPairingUri(): Promise<WalletSession | null> {
+  await restoreAdminWalletSessionFromDb(false);
   try {
     const raw = (await callBaw(['auth', 'signin'], ADMIN_WALLET_SESSION_KEY, 15_000)) as Record<string, unknown>;
     const payload = unwrap(raw);
@@ -1014,7 +1137,11 @@ export async function disconnectAdminWallet(): Promise<void> {
   adminPairingNonce += 1;
   adminWalletSession = null;
   try { await callBaw(['auth', 'signout'], ADMIN_WALLET_SESSION_KEY, 10_000); } catch { /* ok */ }
-  await setAdminWalletConfig(null, false);
+  try { fs.rmSync(getAdminSessionDir(), { recursive: true, force: true }); } catch { /* ok */ }
+  await Promise.all([
+    setAdminWalletConfig(null, false),
+    clearAdminWalletSessionBundle(),
+  ]);
 }
 
 export interface AdminWalletHealth {
@@ -1046,17 +1173,47 @@ async function readChainValueWithRetry<T>(label: string, fn: () => Promise<T>): 
   return { ok: false, error: lastErr };
 }
 
+/** Reads real on-chain BSC BEP-20 USDT + BNB balances for a known address (never fakes 0n on error). */
+async function readKnownAddressBalances(address: string | null): Promise<{
+  usdtBalanceWei: bigint;
+  bnbBalanceWei: bigint;
+  usdtDecimals: number;
+  balanceReadOk: boolean;
+  balanceError?: string;
+}> {
+  if (!address || !/^0x[0-9a-fA-F]{40}$/.test(address)) {
+    return { usdtBalanceWei: 0n, bnbBalanceWei: 0n, usdtDecimals: TOKEN_DECIMALS, balanceReadOk: false };
+  }
+  const [usdtRes, bnbRes, usdtDecimals] = await Promise.all([
+    readChainValueWithRetry('admin.usdtBalance', () => readUsdtBalanceResilient(address)),
+    readChainValueWithRetry('admin.bnbBalance', () => readBnbBalanceResilient(address)),
+    readUsdtDecimals(),
+  ]);
+  const balanceReadOk = usdtRes.ok && bnbRes.ok;
+  return {
+    usdtBalanceWei: usdtRes.ok ? usdtRes.value : 0n,
+    bnbBalanceWei: bnbRes.ok ? bnbRes.value : 0n,
+    usdtDecimals,
+    balanceReadOk,
+    ...(!balanceReadOk
+      ? { balanceError: !usdtRes.ok ? usdtRes.error : !bnbRes.ok ? bnbRes.error : 'RPC read failed' }
+      : {}),
+  };
+}
+
 /**
- * Checks LIVE Admin Agent Wallet connectivity, baw session validity, Developer Mode
- * (enabled, expiry, balance cap, daily quota), and on-chain BSC BEP-20 USDT + BNB balances.
- * Never masks RPC errors as `0n` balances.
+ * Checks LIVE Admin Agent Wallet connectivity, baw session validity (auto-restoring
+ * persisted session bundle after Railway redeploys and retrying transient glitches),
+ * Developer Mode (enabled, expiry, balance cap, daily quota), and REAL on-chain
+ * BSC BEP-20 USDT + BNB balances (even when baw session fails, never reporting fake 0n).
  */
 export async function getAdminWalletStatus(): Promise<AdminWalletHealth> {
   const stored = getAdminWalletConfig();
+  const knownAddress = adminWalletSession?.walletAddress ?? stored.address;
   const base: AdminWalletHealth = {
     connected: false,
     sessionExpired: false,
-    address: adminWalletSession?.walletAddress ?? stored.address,
+    address: knownAddress,
     usdtBalanceWei: 0n,
     bnbBalanceWei: 0n,
     usdtDecimals: TOKEN_DECIMALS,
@@ -1068,37 +1225,74 @@ export async function getAdminWalletStatus(): Promise<AdminWalletHealth> {
   };
 
   if (!bawAvailable()) {
-    return { ...base, error: '@binance/agentic-wallet CLI binary is missing on this server.' };
+    const bals = await readKnownAddressBalances(knownAddress);
+    return { ...base, ...bals, error: '@binance/agentic-wallet CLI binary is missing on this server.' };
   }
 
+  // Restore persisted admin-treasury baw session from DB if container disk was wiped on redeploy
+  await restoreAdminWalletSessionFromDb(false);
+
   let liveAddr: string | null = null;
-  try {
-    const addrRaw = unwrap(
-      (await callBaw(['wallet', 'address'], ADMIN_WALLET_SESSION_KEY, 12_000)) as Record<string, unknown>,
-    );
-    liveAddr = extractBscAddress(addrRaw);
-  } catch (err) {
-    const e = err as Error & { isSessionExpired?: boolean };
-    if (e.isSessionExpired) {
-      await setAdminWalletConfig(base.address, false);
+  let lastAddrErr: (Error & { isSessionExpired?: boolean; isTransientNetwork?: boolean; rawDetail?: string }) | null = null;
+
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    try {
+      const addrRaw = unwrap(
+        (await callBaw(['wallet', 'address'], ADMIN_WALLET_SESSION_KEY, 15_000)) as Record<string, unknown>,
+      );
+      liveAddr = extractBscAddress(addrRaw);
+      lastAddrErr = null;
+      break;
+    } catch (err) {
+      lastAddrErr = err as Error & { isSessionExpired?: boolean; isTransientNetwork?: boolean; rawDetail?: string };
+      logger.warn(
+        {
+          attempt,
+          isSessionExpired: Boolean(lastAddrErr.isSessionExpired),
+          isTransientNetwork: Boolean(lastAddrErr.isTransientNetwork),
+          rawDetail: lastAddrErr.rawDetail ?? lastAddrErr.message.slice(0, 200),
+        },
+        'Admin Agent Wallet baw wallet address check failed',
+      );
+      if (attempt < 2) {
+        // If first attempt failed with expired/unconnected, try force-restoring DB bundle once before retrying
+        if (lastAddrErr.isSessionExpired) {
+          await restoreAdminWalletSessionFromDb(true);
+        }
+        await new Promise((r) => setTimeout(r, 1_200));
+      }
+    }
+  }
+
+  if (lastAddrErr) {
+    // ALWAYS fetch real on-chain balances for knownAddress so alerts never falsely show 0.0000 USDT / 0.000000 BNB!
+    const bals = await readKnownAddressBalances(knownAddress);
+    const detailText = lastAddrErr.rawDetail || lastAddrErr.message.slice(0, 200);
+    if (lastAddrErr.isSessionExpired) {
+      await setAdminWalletConfig(knownAddress, false);
       return {
         ...base,
+        ...bals,
         connected: false,
         sessionExpired: true,
-        error: 'Admin Agent Wallet session expired or disconnected (baw SESSION_EXPIRED).',
+        error: `Admin Agent Wallet session expired or missing on server (${detailText}). Tap /admin_wallet to reconnect.`,
       };
     }
     return {
       ...base,
+      ...bals,
       connected: false,
-      error: `Admin Agent Wallet unreachable: ${e.message.slice(0, 180)}`,
+      sessionExpired: false,
+      error: `Admin Agent Wallet CLI/network error: ${detailText}`,
     };
   }
 
   if (!liveAddr) {
+    const bals = await readKnownAddressBalances(knownAddress);
     await setAdminWalletConfig(null, false);
     return {
       ...base,
+      ...bals,
       connected: false,
       error: 'Admin Agent Wallet is not connected.',
     };
@@ -1118,7 +1312,7 @@ export async function getAdminWalletStatus(): Promise<AdminWalletHealth> {
   let quotaExhausted = false;
   try {
     const settingsRaw = unwrap(
-      (await callBaw(['wallet', 'settings'], ADMIN_WALLET_SESSION_KEY, 12_000)) as Record<string, unknown>,
+      (await callBaw(['wallet', 'settings'], ADMIN_WALLET_SESSION_KEY, 15_000)) as Record<string, unknown>,
     );
     const devModeObj =
       settingsRaw.devMode != null && typeof settingsRaw.devMode === 'object'
@@ -1150,41 +1344,40 @@ export async function getAdminWalletStatus(): Promise<AdminWalletHealth> {
       quotaExhausted = true;
     }
   } catch (err) {
-    const e = err as Error & { isSessionExpired?: boolean };
+    const e = err as Error & { isSessionExpired?: boolean; rawDetail?: string };
     if (e.isSessionExpired) {
+      const bals = await readKnownAddressBalances(liveAddr);
       await setAdminWalletConfig(liveAddr, false);
       return {
         ...base,
+        ...bals,
         address: liveAddr,
         connected: false,
         sessionExpired: true,
-        error: 'Admin Agent Wallet session expired during settings check.',
+        error: `Admin Agent Wallet session expired during settings check (${e.rawDetail ?? e.message.slice(0, 160)}).`,
       };
     }
   }
 
-  const [usdtRes, bnbRes, usdtDecimals] = await Promise.all([
-    readChainValueWithRetry('admin.usdtBalance', () => readUsdtBalance(liveAddr)),
-    readChainValueWithRetry('admin.bnbBalance', () => readBnbBalance(liveAddr)),
-    readUsdtDecimals(),
-  ]);
+  // Keep persisted DB session bundle fresh whenever baw refreshed tokens cleanly
+  void persistAdminWalletSessionToDb();
 
-  const balanceReadOk = usdtRes.ok && bnbRes.ok;
+  const bals = await readKnownAddressBalances(liveAddr);
 
   return {
     connected: true,
     sessionExpired: false,
     address: liveAddr,
-    usdtBalanceWei: usdtRes.ok ? usdtRes.value : 0n,
-    bnbBalanceWei: bnbRes.ok ? bnbRes.value : 0n,
-    usdtDecimals,
-    balanceReadOk,
+    usdtBalanceWei: bals.usdtBalanceWei,
+    bnbBalanceWei: bals.bnbBalanceWei,
+    usdtDecimals: bals.usdtDecimals,
+    balanceReadOk: bals.balanceReadOk,
     devModeEnabled,
     devModeExpired,
     devModeBalanceExceeded,
     quotaExhausted,
-    ...(!balanceReadOk
-      ? { error: `BSC RPC balance read failed: ${!usdtRes.ok ? usdtRes.error : !bnbRes.ok ? bnbRes.error : 'unknown'}` }
+    ...(!bals.balanceReadOk
+      ? { error: `BSC RPC balance read failed: ${bals.balanceError ?? 'unknown'}` }
       : {}),
   };
 }
@@ -1254,8 +1447,9 @@ export async function executeAdminUsdtTransfer(
       failureCode: health.sessionExpired ? 'SESSION_EXPIRED' : 'WALLET_DISCONNECTED',
       reason: health.error ?? 'Admin Agent Wallet is disconnected or session expired.',
       adminWalletAddress: health.address,
-      usdtBalanceWei: health.usdtBalanceWei,
-      bnbBalanceWei: health.bnbBalanceWei,
+      ...(health.balanceReadOk
+        ? { usdtBalanceWei: health.usdtBalanceWei, bnbBalanceWei: health.bnbBalanceWei }
+        : {}),
     };
   }
 
@@ -1414,6 +1608,8 @@ export async function executeAdminUsdtTransfer(
         },
         'Admin Agent Wallet BEP-20 USDT auto-payout confirmed & Transfer log verified on BSC',
       );
+      // Refresh persisted DB session bundle after successful signed transfer
+      void persistAdminWalletSessionToDb();
       return {
         ok: true,
         txHash: execRes.txHash,

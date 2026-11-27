@@ -15,7 +15,7 @@ import {
   startAdminNotificationWorker,
   stopAdminNotificationWorker,
 } from './notifications.js';
-import { bawAvailable, getBawBinPath } from './wallet.js';
+import { bawAvailable, getBawBinPath, restoreAdminWalletSessionOnStartup } from './wallet.js';
 import { ADDR, REFERRER_NAME } from './bsc.js';
 import { logger } from './logger.js';
 
@@ -182,6 +182,7 @@ async function main(): Promise<void> {
   // DB init is non-fatal — bot starts in degraded mode if Supabase is unreachable
   try {
     await initDb();
+    await restoreAdminWalletSessionOnStartup();
   } catch (err) {
     const e = err as Error;
     logger.error(

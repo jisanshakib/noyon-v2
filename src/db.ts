@@ -230,6 +230,38 @@ export async function setAdminWalletConfig(
   };
 }
 
+const ADMIN_WALLET_SESSION_BUNDLE_KEY = 'admin_wallet_session_bundle';
+
+/**
+ * Persists a JSON manifest of the isolated `admin-treasury` baw session directory
+ * into `bot_settings` so the Admin Agent Wallet session survives ephemeral Railway
+ * container redeploys & restarts automatically without forcing manual QR re-pairing.
+ */
+export async function saveAdminWalletSessionBundle(bundleJson: string): Promise<boolean> {
+  return await upsertBotSetting(ADMIN_WALLET_SESSION_BUNDLE_KEY, bundleJson);
+}
+
+/** Loads the persisted `admin-treasury` baw session bundle from `bot_settings` (or null if none). */
+export async function loadAdminWalletSessionBundle(): Promise<string | null> {
+  try {
+    const { rows } = await pool.query<{ value: string }>(
+      `SELECT value FROM bot_settings WHERE key = $1 LIMIT 1`,
+      [ADMIN_WALLET_SESSION_BUNDLE_KEY],
+    );
+    dbReady = true;
+    const val = rows[0]?.value?.trim();
+    return val && val.length > 0 ? val : null;
+  } catch (err) {
+    logger.warn({ err: (err as Error)?.message }, 'loadAdminWalletSessionBundle failed');
+    return null;
+  }
+}
+
+/** Clears the persisted `admin-treasury` baw session bundle on explicit admin disconnect. */
+export async function clearAdminWalletSessionBundle(): Promise<void> {
+  await upsertBotSetting(ADMIN_WALLET_SESSION_BUNDLE_KEY, '');
+}
+
 pool.on('error', (err) => {
   dbReady = false;
   logger.error({ err }, 'Unexpected DB pool error');

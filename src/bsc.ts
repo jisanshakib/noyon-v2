@@ -28,6 +28,19 @@ export const provider = new ethers.JsonRpcProvider(config.BSC_RPC_URL, {
   name: 'bnb',
 });
 
+const READ_FALLBACK_RPC_URLS = [
+  ...new Set([
+    config.BSC_RPC_URL,
+    'https://bsc-dataseed.binance.org',
+    'https://bsc-dataseed1.defibit.io',
+    'https://bsc-dataseed1.ninicoin.io',
+  ]),
+];
+
+const readFallbackProviders: ethers.JsonRpcProvider[] = READ_FALLBACK_RPC_URLS.map((url, idx) =>
+  idx === 0 ? provider : new ethers.JsonRpcProvider(url, { chainId: 56, name: 'bnb' }),
+);
+
 // ─── Address Normalization (EIP-55 safe for ethers v6) ───────────────────────
 
 /**
@@ -497,6 +510,24 @@ export async function readUsdtBalance(address: string): Promise<bigint> {
   return BigInt(await usdtContract().balanceOf(owner));
 }
 
+/**
+ * Multi-RPC resilient BEP-20 USDT (`0x55d398326f99059fF775485246999027B3197955`) balance read.
+ * Tries primary `BSC_RPC_URL` first, then falls back across official BSC public RPCs on transport failure.
+ */
+export async function readUsdtBalanceResilient(address: string): Promise<bigint> {
+  const owner = normalizeAddress(address, 'readUsdtBalanceResilient.owner');
+  let lastErr: unknown;
+  for (const p of readFallbackProviders) {
+    try {
+      const c = new ethers.Contract(ADDR.USDT, ERC20_ABI, p);
+      return BigInt(await c.balanceOf(owner));
+    } catch (err) {
+      lastErr = err;
+    }
+  }
+  throw lastErr ?? new Error('All BSC RPC endpoints failed for USDT balanceOf');
+}
+
 export async function readUsdtAllowance(
   ownerAddress: string,
   spenderAddress = ADDR.MINT_CONTRACT,
@@ -533,6 +564,23 @@ export async function readJagentAllowance(
 export async function readBnbBalance(address: string): Promise<bigint> {
   const wallet = normalizeAddress(address, 'readBnbBalance.address');
   return await provider.getBalance(wallet);
+}
+
+/**
+ * Multi-RPC resilient native BNB balance read.
+ * Tries primary `BSC_RPC_URL` first, then falls back across official BSC public RPCs on transport failure.
+ */
+export async function readBnbBalanceResilient(address: string): Promise<bigint> {
+  const wallet = normalizeAddress(address, 'readBnbBalanceResilient.address');
+  let lastErr: unknown;
+  for (const p of readFallbackProviders) {
+    try {
+      return await p.getBalance(wallet);
+    } catch (err) {
+      lastErr = err;
+    }
+  }
+  throw lastErr ?? new Error('All BSC RPC endpoints failed for BNB getBalance');
 }
 
 // ─── Receipt Polling & Log Parsing ────────────────────────────────────────────
